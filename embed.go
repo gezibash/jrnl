@@ -108,9 +108,10 @@ func format(model string, in Input) string {
 type AI struct {
 	embedURL, embedKey, embedModel, embedID string
 	embedSet                                bool // set by config or JRNL_EMBED_URL, not a default
-	// local: no embeddings API is set up, so bge-small runs in this process.
+	// local: no embeddings API is set up, so bge-small runs in this process,
+	// or in a running jrnl serve (serving: this is that server).
 	// download: this command may download its model (reindex, serve).
-	local, download bool
+	local, download, serving bool
 
 	chatURL, chatKey, chatModel string
 
@@ -400,6 +401,17 @@ func messageContent(in Input) (any, error) {
 
 func (e *AI) embedText(input []string) ([][]float32, error) {
 	if e.local {
+		// A running jrnl serve already holds the model (about 500 MB): ask it,
+		// so commands stay small. Without one, load it here, and start one
+		// for the next command.
+		if !e.serving {
+			if vecs, ok := serverEmbed(input); ok {
+				return vecs, nil
+			}
+			if localDownloaded() {
+				defer startServer()
+			}
+		}
 		vecs, err := local.embed(input, e.download)
 		if errors.Is(err, errNoModel) {
 			// jrnl serve downloads the model and embeds what waited.

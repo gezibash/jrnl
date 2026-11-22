@@ -1474,6 +1474,7 @@ func TestServe(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(home) })
 	e.home = home
+	quitServerAt(t, home) // the first add may start one before the test's own
 	// The command line embeds with the local model, as the server does.
 	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + localDir()}
 	login := firstID(e.must("Users could not sign in after the token refresh.", "add", "--kind", "bug"))
@@ -1537,6 +1538,19 @@ func TestServe(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, "nobody")); err == nil {
 		t.Errorf("serve created a journal for a project it was only asked about")
 	}
+
+	// With the server up, a command embeds through it: this one has no
+	// model of its own to load.
+	own := e.extra
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + filepath.Join(home, "no-model")}
+	refund := firstID(e.must("Refunds failed when the card network timed out.", "add", "--kind", "bug"))
+	if doc := e.must("", "doctor"); strings.Contains(doc, "waiting") {
+		t.Errorf("an add with the server up should be embedded through it:\n%s", doc)
+	}
+	if _, out := search("test", "money back did not go through"); !strings.HasPrefix(out, refund) {
+		t.Errorf("the entry embedded through the server should be found by meaning:\n%s", out)
+	}
+	e.extra = own
 
 	// A new decision like an earlier one: jrnl add names the earlier one and
 	// the command that marks it replaced, and links nothing itself.
@@ -1923,7 +1937,8 @@ func needLocalModel(t testing.TB) {
 func localTestAI(t testing.TB) *AI {
 	t.Helper()
 	needLocalModel(t)
-	return &AI{local: true, embedModel: localModel, embedID: localID, hc: http.DefaultClient, attempts: 1,
+	// serving: as inside jrnl serve, it never asks or starts a server.
+	return &AI{local: true, serving: true, embedModel: localModel, embedID: localID, hc: http.DefaultClient, attempts: 1,
 		from: map[string]string{}, chatErr: errNoChat, mediaErr: errNoMediaEmbed}
 }
 
@@ -1940,6 +1955,7 @@ func serveEnv(home string) []string {
 func TestBuiltInEmbedder(t *testing.T) {
 	needLocalModel(t)
 	e := newEnv(t)
+	quitServerAt(t, e.home)
 	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + localDir()}
 	login := firstID(e.must("Users could not sign in after the token refresh.", "add"))
 	e.must("Chose Go over Bun for the CLI.", "add", "--kind", "decision")
@@ -2008,6 +2024,7 @@ func TestServeBackfill(t *testing.T) {
 func TestBrokenModelWaits(t *testing.T) {
 	needLocalModel(t)
 	e := newEnv(t)
+	quitServerAt(t, e.home)
 	broken := t.TempDir()
 	os.WriteFile(filepath.Join(broken, "model.onnx"), []byte("junk"), 0o644)
 	tok, _ := os.ReadFile(filepath.Join(localDir(), "tokenizer.json"))
@@ -2046,6 +2063,7 @@ func TestModelDownload(t *testing.T) {
 	}))
 	t.Cleanup(hub.Close)
 	e := newEnv(t)
+	quitServerAt(t, e.home)
 	dir := filepath.Join(t.TempDir(), "model")
 	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + dir, "JRNL_MODELS_URL=" + hub.URL}
 	corrupt = true // before add, whose background server downloads too
@@ -2093,4 +2111,30 @@ func TestLocalTokenWindow(t *testing.T) {
 	if _, err := local.embed([]string{code}, false); err != nil {
 		t.Errorf("embedding long text: %v", err)
 	}
+}
+
+// quitServerAt stops the jrnl serve a test's commands started under home,
+// waiting for one that is still starting (it holds the lock before it
+// listens).
+func quitServerAt(t *testing.T, home string) {
+	t.Cleanup(func() {
+		run := filepath.Join(home, ".run")
+		for range 100 {
+			if r, err := socketClient(filepath.Join(run, "jrnl.sock")).Post("http://jrnl/quit", "", nil); err == nil {
+				r.Body.Close()
+				return
+			}
+			lock, err := os.OpenFile(filepath.Join(run, "jrnl.lock"), os.O_RDWR, 0)
+			if err != nil {
+				return // no server ever started here
+			}
+			free := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil
+			lock.Close()
+			if free {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Errorf("a jrnl serve under %s did not quit", home)
+	})
 }

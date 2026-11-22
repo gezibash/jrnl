@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -101,7 +103,7 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	ai.download = true
+	ai.download, ai.serving = true, true
 	if ai.local {
 		if _, err := local.load(true); err != nil {
 			return fmt.Errorf("serve: %w", err)
@@ -203,6 +205,7 @@ func newServer(ai *AI) *server {
 		sv.stop()
 	})
 	sv.mux.HandleFunc("GET /search", sv.handleSearch)
+	sv.mux.HandleFunc("POST /embed", sv.handleEmbed)
 	go func() {
 		for range time.Tick(time.Minute) {
 			sv.mu.Lock()
@@ -657,4 +660,53 @@ func startServer() {
 			go cmd.Wait()
 		}
 	})
+}
+
+// embedRequest is what commands send to POST /embed: texts already
+// formatted for the model, and the embedder their vectors are stored under.
+type embedRequest struct {
+	Embedder string   `json:"embedder"`
+	Inputs   []string `json:"inputs"`
+}
+
+// handleEmbed embeds texts for a command with the model this server holds.
+// It refuses a request for another embedder (a server of another version,
+// or another model), and the command embeds by itself.
+func (sv *server) handleEmbed(w http.ResponseWriter, r *http.Request) {
+	var req embedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Inputs) == 0 {
+		http.Error(w, "give embedder and inputs", http.StatusBadRequest)
+		return
+	}
+	if !sv.ai.local || req.Embedder != sv.ai.embedID {
+		http.Error(w, "this server embeds with "+sv.ai.embedID, http.StatusConflict)
+		return
+	}
+	sv.mu.Lock()
+	sv.last = time.Now()
+	sv.mu.Unlock()
+	vecs, err := local.embed(req.Inputs, false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(vecs)
+}
+
+// serverEmbed asks a running jrnl serve to embed inputs with the built-in
+// model; ok is false when none answers for it.
+func serverEmbed(inputs []string) ([][]float32, bool) {
+	body, _ := json.Marshal(embedRequest{Embedder: localID, Inputs: inputs})
+	c := socketClient(socketPath())
+	c.Timeout = 2 * time.Minute // a reindex sends large batches
+	r, err := c.Post("http://jrnl/embed", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, false
+	}
+	defer r.Body.Close()
+	var vecs [][]float32
+	if r.StatusCode != http.StatusOK || json.NewDecoder(r.Body).Decode(&vecs) != nil || len(vecs) != len(inputs) {
+		return nil, false
+	}
+	return vecs, true
 }
