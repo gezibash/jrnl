@@ -708,21 +708,38 @@ func cmdSearch(args []string) error {
 			fmt.Fprintf(os.Stderr, "jrnl: keyword search only: %v\n", aiErr)
 		}
 	}
+	// One ranking for every text search, the one jrnl serve answers from:
+	// the journal's words and vectors, read into memory (about 5 ms per
+	// 1,000 entries).
+	var cands []candidate
+	if *like != "" {
+		cands, err = nearest(qvec, s.chunkVecs(embedder, modalities, *f))
+	} else {
+		var idx *memIndex
+		var only map[string]bool
+		if idx, err = buildMemIndex(s, embedder); err == nil {
+			if only, err = s.allowed(*f); err == nil {
+				cands = idx.rank(q, qvec, only, order)
+			}
+		}
+	}
+	if err != nil {
+		return err
+	}
 	if *fast && *like == "" && order == "" {
 		g := gateFor(ai.embedModel)
 		if *minScore >= 0 {
 			g = gate{float32(*minScore), float32(*minScore)}
 		}
-		hits, err := fastSearch(s, q, qvec, s.chunkVecs(embedder, modalities, *f), *f, g, *limit)
-		if err != nil {
-			return err
-		}
-		printHits(os.Stdout, hits)
-		return nil
+		cands = gateCut(cands, qvec != nil, g, *limit)
 	}
-	hits, err := s.Search(q, qvec, embedder, modalities, *f, order)
+	hits, err := s.hits(cands, q)
 	if err != nil {
 		return err
+	}
+	if *fast && *like == "" && order == "" {
+		printHits(os.Stdout, hits)
+		return nil
 	}
 	if len(hits) == 0 && aiErr != nil && awaitingSetup(s, aiErr) {
 		fmt.Fprintln(os.Stderr, "jrnl: no keyword match; search by meaning is off (see `jrnl doctor`)")
@@ -1041,14 +1058,6 @@ func rerank(ai *AI, q string, hits []Hit, k int) []Hit {
 		}
 	}
 	return out
-}
-
-func embed(ins []Input) ([][]float32, error) {
-	ai, err := NewAI()
-	if err != nil {
-		return nil, err
-	}
-	return ai.Embed(ins)
 }
 
 func cmdClose(args []string) error {

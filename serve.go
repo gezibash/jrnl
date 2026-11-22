@@ -26,8 +26,8 @@ import (
 
 // jrnl serve answers searches over a Unix socket from memory, the way
 // Typesense does: the model and every entry's vector stay loaded, so a search
-// costs a static embedding (microseconds), a vector scan and a keyword query,
-// not a process start, a git call and an embedding server round trip.
+// costs one embedding of the question (about 8 ms), a vector scan and a
+// keyword lookup, not a process start, a git call and a model load.
 // Coding-agent hooks call it on every prompt.
 
 const (
@@ -293,16 +293,8 @@ func (sv *server) search(project, q string, limit int, exclude ...string) ([]Hit
 	if v, err := sv.ai.Embed([]Input{{Text: q, Query: true}}); err == nil {
 		qvec = v[0]
 	}
-	cands := slices.DeleteFunc(p.idx.rank(q, qvec), func(c candidate) bool { return slices.Contains(exclude, c.id) })
-	hits, err := p.s.hits(gateCut(cands, qvec != nil, gateFor(sv.ai.embedModel), limit))
-	if err != nil {
-		return nil, err
-	}
-	terms := queryTerms(q)
-	for i := range hits {
-		hits[i].Snippet = snippet(hits[i].Entry.Body, terms)
-	}
-	return hits, nil
+	cands := slices.DeleteFunc(p.idx.rank(q, qvec, nil, ""), func(c candidate) bool { return slices.Contains(exclude, c.id) })
+	return p.s.hits(gateCut(cands, qvec != nil, gateFor(sv.ai.embedModel), limit), q)
 }
 
 // unload closes the journals last searched before cutoff. The caller holds sv.mu.

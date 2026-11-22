@@ -22,9 +22,11 @@ import (
 )
 
 const (
-	// Text is embedded locally. On the 20,000-entry test, Ollama answered in
-	// 40 ms (worst 0.85 s) against 1.5 s (worst 10 s, with 429s) on Workers AI,
-	// and found as many right answers (21-22 of 30 against 21).
+	// The model a bare JRNL_EMBED_MODEL or OLLAMA_HOST setup means; the
+	// default is the built-in one (local.go). On the 20,000-entry test,
+	// Ollama answered in 40 ms (worst 0.85 s) against 1.5 s (worst 10 s,
+	// with 429s) on Workers AI, and found as many right answers (21-22 of
+	// 30 against 21).
 	ollamaModel = "embeddinggemma-2:270m"
 	// The model's window is 8,192 tokens; this keeps long entries well inside it.
 	maxDocChars = 24000
@@ -99,8 +101,8 @@ func format(model string, in Input) string {
 }
 
 // AI reaches the models jrnl uses, all optional:
-//   - text embeddings: any OpenAI-compatible /embeddings API; by default
-//     Ollama on this machine.
+//   - text embeddings: by default the built-in model (local.go); or any
+//     OpenAI-compatible /embeddings API, such as Ollama on this machine.
 //   - chat, for captions, reranking and summaries: any OpenAI-compatible
 //     /chat/completions API.
 //   - a reranker with a Cohere-style /rerank API.

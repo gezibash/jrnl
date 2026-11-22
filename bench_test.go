@@ -128,7 +128,7 @@ func BenchmarkRank(b *testing.B) {
 		vecs[i] = v[0]
 	}
 	for i := 0; b.Loop(); i++ {
-		p.idx.rank(benchQueries[i%len(benchQueries)], vecs[i%len(vecs)])
+		p.idx.rank(benchQueries[i%len(benchQueries)], vecs[i%len(vecs)], nil, "")
 	}
 }
 
@@ -157,7 +157,7 @@ func BenchmarkLoadHits(b *testing.B) {
 		cands[i].id = fmt.Sprint(p.idx.ids[i*1000])
 	}
 	for b.Loop() {
-		if _, err := p.s.hits(cands); err != nil {
+		if _, err := p.s.hits(cands, ""); err != nil {
 			b.Fatal(err)
 		}
 	}

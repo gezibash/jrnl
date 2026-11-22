@@ -627,19 +627,20 @@ func TestStopwordsAreNotKeywordHits(t *testing.T) {
 }
 
 // Search must follow the reranker's order, and fall back to keyword+vector
-// order when the reranker fails.
+// order when the reranker fails. ("folder" makes the second entry a
+// candidate: one that shares no word and no meaning with the query is not.)
 func TestSearchFollowsRerankerAndSurvivesItsFailure(t *testing.T) {
 	e := newEnv(t)
 	login := firstID(e.must("Login rejects valid credentials after deploy.", "add"))
 	other := firstID(e.must("Moved the docs folder (rerank-me).", "add"))
 
-	out := e.must("", "search", "login credentials")
+	out := e.must("", "search", "login credentials folder")
 	if !strings.HasPrefix(out, other) || !strings.Contains(strings.SplitN(out, "\n", 2)[0], "reranked") {
 		t.Fatalf("reranker's pick should come first, marked reranked:\n%s", out)
 	}
 
 	e.ai.rerankFail.Store(true)
-	out, errOut, err := e.run("", "search", "login credentials")
+	out, errOut, err := e.run("", "search", "login credentials folder")
 	if err != nil {
 		t.Fatalf("search failed when the reranker did: %v\n%s", err, errOut)
 	}
@@ -657,7 +658,7 @@ func TestSearchDoesNotWaitOnSlowReranker(t *testing.T) {
 
 	e.ai.rerankDelay.Store(10)
 	start := time.Now()
-	out, errOut, err := e.run("", "search", "login credentials")
+	out, errOut, err := e.run("", "search", "login credentials folder")
 	took := time.Since(start)
 	if err != nil {
 		t.Fatalf("search: %v\n%s", err, errOut)
@@ -672,7 +673,7 @@ func TestSearchDoesNotWaitOnSlowReranker(t *testing.T) {
 	e.ai.rerankDelay.Store(0)
 	e.ai.rerankFail.Store(true)
 	start = time.Now()
-	e.must("", "search", "login credentials")
+	e.must("", "search", "login credentials folder")
 	if took := time.Since(start); took > 3*time.Second {
 		t.Errorf("search retried a failing reranker for %s", took.Round(time.Second))
 	}
