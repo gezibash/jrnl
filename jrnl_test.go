@@ -803,7 +803,7 @@ func TestVectorsFromAnotherEmbedderAreIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE chunks SET embedder = 'some-other/model/768'`); err != nil {
+	if _, err := db.Exec(`UPDATE vectors SET embedder = 'some-other/model/768'`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
@@ -978,10 +978,10 @@ func TestUpgradeFromSchema1(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, q := range []string{
+	for _, q := range append(slices.Clone(beforeSchema6), []string{
 		`ALTER TABLE entries DROP COLUMN status`, `ALTER TABLE entries DROP COLUMN closed_at`,
 		`ALTER TABLE entries DROP COLUMN closed_by`, `ALTER TABLE chunks DROP COLUMN embedder`, `PRAGMA user_version = 1`,
-	} {
+	}...) {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
@@ -1151,6 +1151,15 @@ func TestSwitchEmbeddingModel(t *testing.T) {
 	}
 }
 
+// beforeSchema6 puts a journal's vectors back where they were before
+// schema 6: one per piece, on its row, with the embedder that made it.
+var beforeSchema6 = []string{
+	`ALTER TABLE chunks ADD COLUMN vec BLOB`, `ALTER TABLE chunks ADD COLUMN embedder TEXT NOT NULL DEFAULT ''`,
+	`UPDATE chunks SET vec = (SELECT vec FROM vectors WHERE chunk_id = chunks.id),
+		embedder = COALESCE((SELECT embedder FROM vectors WHERE chunk_id = chunks.id), '')`,
+	`DROP TABLE vectors`,
+}
+
 // A journal from before schema 3 has vectors named by the old scheme. They
 // came from the same models and APIs, so they keep working without reindex:
 // text from Ollama, and media from Workers AI (now a cloudflare provider).
@@ -1163,10 +1172,10 @@ func TestUpgradeKeepsOldVectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, q := range []string{
+	for _, q := range append(slices.Clone(beforeSchema6),
 		`UPDATE chunks SET embedder = 'ollama/embeddinggemma-2:270m/768' WHERE modality IN ('text', 'caption')`,
 		`UPDATE chunks SET embedder = 'workers-ai/embeddinggemma-2/768' WHERE modality = 'image'`,
-		`PRAGMA user_version = 2`} {
+		`PRAGMA user_version = 2`) {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatal(err)
 		}
@@ -1903,7 +1912,7 @@ func TestUpgradeTypesLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	for _, q := range []string{`ALTER TABLE links DROP COLUMN type`, `PRAGMA user_version = 4`} {
+	for _, q := range append(slices.Clone(beforeSchema6), `ALTER TABLE links DROP COLUMN type`, `PRAGMA user_version = 4`) {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
@@ -1992,7 +2001,7 @@ func TestServeBackfill(t *testing.T) {
 		}
 	}
 	// One of them has a vector, from an embedder the server does not use.
-	if _, err := s.db.Exec(`UPDATE chunks SET vec = ?, embedder = 'old-model@elsewhere' WHERE entry_id = ?`,
+	if _, err := s.db.Exec(`INSERT INTO vectors SELECT id, 'old-model@elsewhere', ? FROM chunks WHERE entry_id = ?`,
 		encodeVec(make([]float32, 8)), other.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -2014,7 +2023,7 @@ func TestServeBackfill(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	var n int
-	s.db.QueryRow(`SELECT count(*) FROM chunks WHERE embedder = ? AND vec IS NOT NULL`, localID).Scan(&n)
+	s.db.QueryRow(`SELECT count(*) FROM vectors WHERE embedder = ?`, localID).Scan(&n)
 	if n != 2 {
 		t.Errorf("want both entries' vectors stored by the server's embedder, got %d", n)
 	}
@@ -2295,10 +2304,9 @@ func TestRmErases(t *testing.T) {
 	}
 }
 
-// A server started under one embedder must not undo a reindex done after
-// config.toml named another: each chunk holds one vector, and the server
-// embedded every entry again its own way on the next search. It quits
-// instead, and the vectors stay.
+// A server started under one embedder must not go on working for it after
+// config.toml names another: it quits at the next search that finds
+// entries without its vectors, and embeds nothing more its old way.
 func TestServeQuitsWhenTheEmbedderChanges(t *testing.T) {
 	e := newEnv(t)
 	home, err := os.MkdirTemp("/tmp", "jrs") // a socket path is limited to 104 bytes
@@ -2329,19 +2337,23 @@ func TestServeQuitsWhenTheEmbedderChanges(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	// The settings change, and an entry is written under the new ones: the
+	// server has no vector of its own for it.
 	e.config = conf("emb-b")
-	e.must("", "reindex")
-	embedders := func() string {
-		out, err := exec.Command("sqlite3", filepath.Join(home, "test", "journal.db"),
-			"select group_concat(distinct embedder) from chunks").Output()
+	e.must("Sessions expire after an hour.", "add")
+	count := func(model string) (n int) {
+		db, err := sql.Open("sqlite", "file:"+filepath.Join(home, "test", "journal.db"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		return strings.TrimSpace(string(out))
+		defer db.Close()
+		if err := db.QueryRow(`SELECT count(*) FROM vectors WHERE embedder LIKE ? || '@%'`, model).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
 	}
-	want := embedders()
-	if !strings.HasPrefix(want, "emb-b@") {
-		t.Fatalf("reindex should have embedded with the new model, got %q", want)
+	if a, b := count("emb-a"), count("emb-b"); a != 2 || b != 1 {
+		t.Fatalf("want 2 vectors from the old model and 1 from the new, got %d and %d", a, b)
 	}
 	if r, err := socketClient(sock).Get("http://jrnl/search?project=test&q=login+credentials"); err == nil {
 		r.Body.Close()
@@ -2352,7 +2364,118 @@ func TestServeQuitsWhenTheEmbedderChanges(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if got := embedders(); got != want {
-		t.Errorf("the server embedded again with its old model: %q, want %q", got, want)
+	if a := count("emb-a"); a != 2 {
+		t.Errorf("the server embedded the new entry with its old model: %d vectors, want 2", a)
+	}
+}
+
+// Two embedders can work on one journal: each keeps its own vectors.
+// With one vector a piece, a reindex under JRNL_EMBED_* for one command
+// replaced every vector, and whatever ran under the usual settings (a
+// search, a jrnl serve) then found the journal waiting and embedded it
+// all again.
+func TestEmbeddersKeepTheirOwnVectors(t *testing.T) {
+	e := newEnv(t)
+	id := firstID(e.must("Login form rejects valid credentials.", "add"))
+	usual := e.extra
+	e.extra = []string{"JRNL_EMBED_MODEL=another-model"}
+	if out := e.must("", "reindex"); !strings.Contains(out, "embedded 1 pending") {
+		t.Fatalf("the other embedder should embed the entry for itself:\n%s", out)
+	}
+	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) || !strings.Contains(out, "vector") {
+		t.Errorf("not found by meaning under the other embedder:\n%s", out)
+	}
+	e.extra = usual
+	if doc := e.must("", "doctor"); strings.Contains(doc, "waiting") {
+		t.Errorf("the first embedder's vectors should still be there:\n%s", doc)
+	}
+	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) || !strings.Contains(out, "vector") {
+		t.Errorf("not found by meaning under the first embedder again:\n%s", out)
+	}
+}
+
+// A jrnl serve of another version holds a journal open with the old
+// schema's queries: after an upgrade moved the vectors, each of its
+// searches would fail, and nothing would replace it while prompts kept it
+// from idling out. The command that upgrades a journal asks it to quit.
+func TestUpgradeStopsAServerOfAnotherVersion(t *testing.T) {
+	e := newEnv(t)
+	home, err := os.MkdirTemp("/tmp", "jrs") // a socket path is limited to 104 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	e.home, e.dir = home, filepath.Join(t.TempDir(), "test")
+	os.MkdirAll(e.dir, 0o755)
+	quitServerAt(t, home)
+	e.must("Login form rejects valid credentials.", "add")
+	e.must("", "serve", "--background")
+	sock := filepath.Join(home, ".run", "jrnl.sock")
+	up := func() bool {
+		_, _, ok := runningServer(sock)
+		return ok
+	}
+	for i := 0; !up(); i++ {
+		if i == 100 {
+			t.Fatal("the server did not start")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(home, "test", "journal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range append(slices.Clone(beforeSchema6), `PRAGMA user_version = 5`) {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	// This process is the newer jrnl.
+	old := version
+	version = "9.9.9"
+	t.Cleanup(func() { version = old })
+	t.Setenv("JRNL_HOME", home)
+	s, err := Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	for i := 0; up(); i++ {
+		if i == 60 {
+			t.Fatal("the other version's server is still running 3 s after the upgrade")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// Vectors of a model no longer set up stay until asked away: doctor says
+// they are there, and reindex --prune deletes them and nothing else.
+func TestPruneRemovesUnusedVectors(t *testing.T) {
+	e := newEnv(t)
+	id := firstID(e.must("Login form rejects valid credentials.", "add"))
+	usual := e.extra
+	e.extra = []string{"JRNL_EMBED_MODEL=tried-once"}
+	e.must("", "reindex")
+	e.extra = usual
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "1 vector(s) from tried-once@") {
+		t.Errorf("doctor should list the other model's vector:\n%s", doc)
+	}
+	if out := e.must("", "reindex"); strings.Contains(out, "removed") {
+		t.Errorf("reindex without --prune removed vectors:\n%s", out)
+	}
+	if out := e.must("", "reindex", "--prune"); !strings.Contains(out, "removed 1 vector(s) from tried-once@") {
+		t.Errorf("reindex --prune should say what it removed:\n%s", out)
+	}
+	if doc := e.must("", "doctor"); strings.Contains(doc, "tried-once") || strings.Contains(doc, "waiting") {
+		t.Errorf("after pruning, only the current model's vectors should be left, none waiting:\n%s", doc)
+	}
+	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) || !strings.Contains(out, "vector") {
+		t.Errorf("the current model's vector should still find it:\n%s", out)
+	}
+	e.extra = []string{"JRNL_EMBED_MODEL=tried-once"}
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "1 item(s) waiting") {
+		t.Errorf("the pruned model should have the entry to embed again:\n%s", doc)
 	}
 }

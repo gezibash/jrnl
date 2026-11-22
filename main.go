@@ -51,6 +51,7 @@ const usage = `jrnl — per-project journal
   jrnl summarize [filters]     summary of a period, citing entry IDs; saved and reused
       --refresh                write it again even if nothing changed
   jrnl reindex                 describe and embed whatever failed earlier
+      --prune                  also delete the vectors of embedding models no longer set up
   jrnl backup                  consistent copy of the database
   jrnl where                   print this project's journal directory
   jrnl doctor                  what is set up, and how to turn on the rest
@@ -709,7 +710,7 @@ func cmdSearch(args []string) error {
 		}
 	}
 	// One ranking for every text search, the one jrnl serve answers from:
-	// the journal's words and vectors, read into memory (about 5 ms per
+	// the journal's words and vectors, read into memory (about 8 ms per
 	// 1,000 entries).
 	var cands []candidate
 	if *like != "" {
@@ -796,6 +797,7 @@ func printHits(w io.Writer, hits []Hit) {
 
 func cmdReindex(args []string) error {
 	fs, project := newFlags("reindex")
+	prune := fs.Bool("prune", false, "")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -809,12 +811,6 @@ func cmdReindex(args []string) error {
 		return err
 	}
 	ai.download = true // reindex is how the embedding model gets downloaded
-	if _, emb, ok := runningServer(socketPath()); ok && emb != "" && emb != ai.embedID {
-		// Seen with JRNL_EMBED_* set for this command alone: the server,
-		// started without them, embedded everything again with its own.
-		fmt.Fprintf(os.Stderr, "jrnl: jrnl serve is running with %s, not %s. It stops by itself if config.toml now names the "+
-			"new one; if JRNL_EMBED_* is set for this command alone, it will embed these entries again its way\n", emb, ai.embedID)
-	}
 	r, err := process(s, ai, "", false)
 	if err != nil {
 		return err
@@ -827,6 +823,18 @@ func cmdReindex(args []string) error {
 		fmt.Printf(", %d still pending (%v)", r.waiting, r.lastErr)
 	}
 	fmt.Println()
+	if *prune {
+		unused, err := s.Unused(ai.embedID, ai.mediaID)
+		if err != nil {
+			return err
+		}
+		if err := s.Prune(ai.embedID, ai.mediaID); err != nil {
+			return err
+		}
+		for _, u := range unused {
+			fmt.Printf("removed %d vector(s) from %s\n", u.N, u.Key)
+		}
+	}
 	return nil
 }
 
@@ -1147,8 +1155,12 @@ func cmdDoctor(args []string) error {
 		return err
 	}
 	total, waiting := 0, 0
+	var unused []Count
 	if s != nil {
 		defer s.Close()
+		if unused, err = s.Unused(ai.embedID, ai.mediaID); err != nil {
+			return err
+		}
 		if total, _, _, _, err = s.Stats(Filter{}); err != nil {
 			return err
 		}
@@ -1178,6 +1190,9 @@ func cmdDoctor(args []string) error {
 		fmt.Printf(", %d item(s) waiting for `jrnl reindex`", waiting)
 	}
 	fmt.Println()
+	for _, u := range unused {
+		fmt.Printf("%-10s %d vector(s) from %s, which is not set up now; `jrnl reindex --prune` deletes them\n", "", u.N, u.Key)
+	}
 	row("basics", true, "add, list, show, keyword search, stats, close", "")
 
 	// where says which setting chose a role, when it wasn't a default.
@@ -1227,10 +1242,13 @@ func cmdDoctor(args []string) error {
 		}
 	}
 	row("parakeet", parakeetOn, "transcripts of audio and video", how)
-	running, _, ok := runningServer(socketPath())
+	running, emb, ok := runningServer(socketPath())
 	how = "`jrnl serve --background`; jrnl add starts it when entries wait for the embedding model"
 	if ok {
 		how = "server " + running + " running at " + socketPath()
+		if running == version && emb != ai.embedID {
+			how += ", embedding with " + emb + " (started under other settings)"
+		}
 	}
 	row("serve", ok, "searches from memory in milliseconds, for coding-agent hooks", how)
 	if waiting > 0 {

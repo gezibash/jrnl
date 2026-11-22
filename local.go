@@ -25,10 +25,11 @@ import (
 // (hugot's GoMLX backend): no server, no key, no network after the model's
 // one download (128 MB, into the user cache).
 //
-// On the tycoon journal's 27 reworded questions and 18 unrelated ones
-// (2026-11-22, vectors alone): right entry first for 23, in the top 5 for
-// all 27, against 24 and 27 for EmbeddingGemma through Ollama and 18 and 25
-// for potion-base-32M; unrelated questions scored lowest of the three.
+// On a real journal's 27 reworded questions and 18 unrelated ones
+// (2026-11-22, vectors alone, mean pooling): right entry first for 23, in
+// the top 5 for all 27, against 24 and 27 for EmbeddingGemma through Ollama
+// and 18 and 25 for potion-base-32M; unrelated questions scored lowest of
+// the three. With [CLS] pooling, as it runs now, 24 (see embed below).
 // About 8 ms a query and 19 ms an entry on Apple M-series with
 // GOEXPERIMENT=simd, as releases are built; about twice and six times that
 // without.
@@ -150,7 +151,7 @@ func (l *localEmbedder) embed(texts []string, download bool) ([][]float32, error
 			return nil, err
 		}
 		// The model is trained for its first token's state ([CLS]), not the
-		// mean: on the tycoon set, right entry first for 24 of 27 against 23.
+		// mean: on that set, right entry first for 24 of 27 against 23.
 		r, err := p.RunRaw(context.Background(), fitTokens(p, texts[i:min(i+4, len(texts))]))
 		l.run.Unlock()
 		if err != nil {

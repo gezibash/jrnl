@@ -78,19 +78,29 @@ var schema = []string{
 		caption TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY (entry_id, hash)
 	)`,
-	// One row per embedded piece. vec IS NULL means the embedding is pending.
-	// modality: text (the entry), caption (an attachment's description), or
-	// image / video / audio (the raw media, used only by search --like).
+	// One row per piece to embed. modality: text (the entry), caption (an
+	// attachment's description), or image / video / audio (the raw media,
+	// used only by search --like).
 	`CREATE TABLE IF NOT EXISTS chunks (
 		id INTEGER PRIMARY KEY,
 		entry_id TEXT NOT NULL REFERENCES entries(id),
 		hash TEXT NOT NULL DEFAULT '',
 		modality TEXT NOT NULL,
-		vec BLOB,
-		error TEXT NOT NULL DEFAULT '', -- set when the input can never embed
-		embedder TEXT NOT NULL DEFAULT '' -- which model and path made vec
+		error TEXT NOT NULL DEFAULT '' -- set when the input can never embed
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS chunks_piece ON chunks(entry_id, hash, modality)`,
+	// A piece's vector from each embedder (model and host) that has embedded
+	// it. One per embedder, so two of them at work on one journal (a server
+	// started under other settings, a trial of another model) each add
+	// their own and leave the other's alone; with one vector a piece, each
+	// re-embedded the whole journal after the other. A piece with none from
+	// the current embedder is pending.
+	`CREATE TABLE IF NOT EXISTS vectors (
+		chunk_id INTEGER NOT NULL REFERENCES chunks(id),
+		embedder TEXT NOT NULL,
+		vec BLOB NOT NULL,
+		PRIMARY KEY (chunk_id, embedder)
+	)`,
 	`CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
 		entry_id UNINDEXED, title, body, tags, captions,
 		tokenize = 'porter unicode61'
@@ -149,6 +159,9 @@ func Open(project string) (*Store, error) {
 	if v > schemaVersion {
 		return nil, fmt.Errorf("%s was written by a newer jrnl (schema %d, this jrnl knows %d)", dir, v, schemaVersion)
 	}
+	if v == schemaVersion {
+		return s, nil // another process upgraded it while this one waited
+	}
 	if v > 0 {
 		// Bring an existing journal up to date before creating anything new.
 		for _, c := range []struct{ table, col, def string }{
@@ -193,16 +206,42 @@ func Open(project string) (*Store, error) {
 			return nil, fmt.Errorf("upgrade: %w", err)
 		}
 	}
+	if v > 0 && v < 6 {
+		// Before 6, a piece's one vector and its embedder sat on its row.
+		for _, q := range []string{
+			`INSERT OR IGNORE INTO vectors (chunk_id, embedder, vec) SELECT id, embedder, vec FROM chunks WHERE vec IS NOT NULL`,
+			`ALTER TABLE chunks DROP COLUMN vec`, `ALTER TABLE chunks DROP COLUMN embedder`,
+		} {
+			if _, err := tx.Exec(q); err != nil {
+				return nil, fmt.Errorf("upgrade: %w", err)
+			}
+		}
+	}
 	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return nil, err
 	}
-	return s, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if v > 0 {
+		// A jrnl serve of another version has this journal open with the
+		// old schema's queries, and would fail every search from here on.
+		// Asked to quit, it is replaced by the next command that needs one.
+		sock := socketPath()
+		if running, _, ok := runningServer(sock); ok && running != version {
+			if r, err := socketClient(sock).Post("http://jrnl/quit", "", nil); err == nil {
+				r.Body.Close()
+			}
+		}
+	}
+	return s, nil
 }
 
 // 1: first release. 2: open/closed status on entries. 3: text embedders
 // named by model and host. 4: media embedders named the same way. 5: typed
-// links (relates, supersedes, closes).
-const schemaVersion = 5
+// links (relates, supersedes, closes). 6: vectors in their own table, one
+// per piece and embedder.
+const schemaVersion = 6
 
 func addColumn(tx *sql.Tx, table, col, def string) error {
 	var n int
@@ -222,6 +261,7 @@ func (s *Store) Delete(id string) error {
 	}
 	defer tx.Rollback()
 	for _, q := range []string{
+		`DELETE FROM vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE entry_id = ?)`,
 		`DELETE FROM chunks WHERE entry_id = ?`, `DELETE FROM entries_fts WHERE entry_id = ?`,
 		`DELETE FROM tags WHERE entry_id = ?`, `DELETE FROM links WHERE src = ? OR dst = ?`,
 		`DELETE FROM files WHERE entry_id = ?`, `DELETE FROM entry_assets WHERE entry_id = ?`,
@@ -281,12 +321,24 @@ func (s *Store) Remove(ids []string) (summaries int, err error) {
 			return summaries, err
 		}
 	}
-	for _, q := range []string{`INSERT INTO entries_fts(entries_fts) VALUES('optimize')`, `VACUUM`, `PRAGMA wal_checkpoint(TRUNCATE)`} {
+	for _, q := range []string{`INSERT INTO entries_fts(entries_fts) VALUES('optimize')`, `VACUUM`} {
 		if _, err := s.db.Exec(q); err != nil {
 			return summaries, fmt.Errorf("removed, but the database was not rewritten (%s): %w", q, err)
 		}
 	}
-	return summaries, nil
+	// A checkpoint that another process's read holds up says so in its
+	// answer, not as an error; the old pages would then stay in the log.
+	var busy, logged, done int
+	for range 50 {
+		if err := s.db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logged, &done); err != nil {
+			return summaries, fmt.Errorf("removed, but the write-ahead log was not emptied: %w", err)
+		}
+		if busy == 0 {
+			return summaries, nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return summaries, errors.New("removed, but another process kept the write-ahead log busy for 5 s, so the text may still be in journal.db-wal; run `jrnl rm` on it again")
 }
 
 // SetStatus opens, closes or reopens entries. closedBy is the entry holding
@@ -823,11 +875,13 @@ type pending struct {
 	in       Input
 }
 
-// staleChunks matches chunks that need a vector from the current embedders:
-// none yet, or one from another model. Media chunks count only when a media
-// embedder is set up (mediaEmb != "").
-const staleChunks = `((c.modality IN ('text', 'caption') AND (c.vec IS NULL OR c.embedder != ?))
-	OR (? != '' AND c.modality NOT IN ('text', 'caption') AND (c.vec IS NULL OR c.embedder != ?))) AND c.error = ''`
+// staleChunks matches chunks with no vector from the current embedders.
+// Media chunks count only when a media embedder is set up (mediaEmb != "").
+const staleChunks = `c.error = '' AND (
+	(c.modality IN ('text', 'caption')
+		AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.embedder = ?))
+	OR (? != '' AND c.modality NOT IN ('text', 'caption')
+		AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.embedder = ?)))`
 
 // Pending returns chunks of the entry (or all entries, for "") that need a
 // vector (staleChunks): after a switch of embedding model, reindex brings
@@ -871,8 +925,8 @@ func (s *Store) Pending(entryID, textEmb, mediaEmb string) ([]pending, error) {
 // HasTextVectors reports whether any text here has ever been embedded.
 func (s *Store) HasTextVectors() bool {
 	var n int
-	s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM chunks
-		WHERE vec IS NOT NULL AND modality IN ('text', 'caption') LIMIT 1)`).Scan(&n)
+	s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM vectors v JOIN chunks c ON c.id = v.chunk_id
+		WHERE c.modality IN ('text', 'caption') LIMIT 1)`).Scan(&n)
 	return n > 0
 }
 
@@ -886,6 +940,43 @@ func (s *Store) Waiting(textEmb, mediaEmb string) (int, error) {
 	return n, err
 }
 
+// Unused counts the vectors of each embedder other than keep (the ones the
+// settings name now): left by a model no longer used, or one tried once.
+func (s *Store) Unused(keep ...string) ([]Count, error) {
+	rows, err := s.db.Query(`SELECT embedder, count(*) FROM vectors GROUP BY embedder ORDER BY embedder`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Count
+	for rows.Next() {
+		var c Count
+		if err := rows.Scan(&c.Key, &c.N); err != nil {
+			return nil, err
+		}
+		if !slices.Contains(keep, c.Key) {
+			out = append(out, c)
+		}
+	}
+	return out, rows.Err()
+}
+
+// Prune deletes the vectors Unused counts. Nothing does this by itself:
+// an embedder that still runs somewhere (a jrnl serve started under other
+// settings) would embed the journal again.
+func (s *Store) Prune(keep ...string) error {
+	unused, err := s.Unused(keep...)
+	if err != nil {
+		return err
+	}
+	for _, u := range unused {
+		if _, err := s.db.Exec(`DELETE FROM vectors WHERE embedder = ?`, u.Key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // captionInput is how an attachment's description is embedded, both when it
 // is stored and when search --like looks for one like it.
 func captionInput(name, caption, desc string) Input {
@@ -893,7 +984,8 @@ func captionInput(name, caption, desc string) Input {
 }
 
 func (s *Store) SetVec(chunkID int64, v []float32, embedder string) error {
-	_, err := s.db.Exec(`UPDATE chunks SET vec = ?, embedder = ? WHERE id = ?`, encodeVec(v), embedder, chunkID)
+	_, err := s.db.Exec(`INSERT INTO vectors (chunk_id, embedder, vec) VALUES (?,?,?)
+		ON CONFLICT (chunk_id, embedder) DO UPDATE SET vec = excluded.vec`, chunkID, embedder, encodeVec(v))
 	return err
 }
 

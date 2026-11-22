@@ -61,9 +61,9 @@ func (s *Store) chunkVecs(embedder string, modalities []string, f Filter) vecSou
 		for _, m := range modalities {
 			margs = append(margs, m)
 		}
-		rows, err := s.db.Query(`SELECT c.entry_id, c.modality, c.hash, c.vec FROM chunks c
-			JOIN entries e ON e.id = c.entry_id
-			WHERE c.vec IS NOT NULL AND c.embedder = ? AND c.modality IN (`+marks+`) AND `+w, append(margs, args...)...)
+		rows, err := s.db.Query(`SELECT c.entry_id, c.modality, c.hash, v.vec FROM vectors v
+			JOIN chunks c ON c.id = v.chunk_id JOIN entries e ON e.id = c.entry_id
+			WHERE v.embedder = ? AND c.modality IN (`+marks+`) AND `+w, append(margs, args...)...)
 		if err != nil {
 			return err
 		}
@@ -154,7 +154,7 @@ func (s *Store) hits(cands []candidate, q string) ([]Hit, error) {
 }
 
 // gate decides which fast-search candidates are shown: those with every
-// query term, one of them rare (an identifier such as CarryPose, which
+// query term, one of them rare (an identifier such as RetryPolicy, which
 // an embedding model places poorly), those both signals found with a meaning score of at least
 // both, or the vector alone with at least alone. Neither signal alone separates: on the test set below,
 // unrelated questions scored up to 0.72 with EmbeddingGemma, and some
@@ -169,6 +169,8 @@ var (
 	// bge-small-en-v1.5 ([CLS] pooling) through jrnl serve's ranking, fitted
 	// 2026-11-22 on the same 27 questions plus 18 unrelated ones: 25 of 27
 	// shown, 2 of 18 unrelated show a hit (potion-base-32M: 24 and 2).
+	// The journal grows: at 159 entries, 25 of 27 and 3 of 18 (eval_test.go
+	// measures it, see there).
 	localGate = gate{0.64, 0.64}
 )
 

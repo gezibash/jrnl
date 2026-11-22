@@ -33,7 +33,7 @@ import (
 const (
 	serveIdle = 30 * time.Minute // exit after this long without a request
 	// A journal unsearched this long is closed and its index freed (about
-	// 1.2 KB an entry); the next search reloads it in about 5 ms per 1,000.
+	// 1.2 KB an entry); the next search reloads it in about 8 ms per 1,000.
 	projectIdle = 10 * time.Minute
 )
 
@@ -184,9 +184,9 @@ type server struct {
 	quitOnce sync.Once
 	mux      *http.ServeMux
 	// reconfigured says the settings now name another embedder than the one
-	// this server started with. Each chunk holds one vector, so embedding
-	// with the old one would undo a reindex done with the new one, on every
-	// search: the server quits instead, and the next one starts right.
+	// this server started with. It would go on answering with the old one
+	// and embedding new entries for it: the server quits instead, and the
+	// next one starts with the model the settings name.
 	reconfigured func() bool
 }
 

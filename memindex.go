@@ -115,8 +115,8 @@ func (m *memIndex) loadVecs(s *Store) error {
 	if len(want) == 0 {
 		return nil
 	}
-	rows, err := s.db.Query(`SELECT entry_id, hash, vec FROM chunks
-		WHERE embedder = ? AND vec IS NOT NULL AND modality IN ('text', 'caption') ORDER BY id`, m.embedder)
+	rows, err := s.db.Query(`SELECT c.entry_id, c.hash, v.vec FROM vectors v JOIN chunks c ON c.id = v.chunk_id
+		WHERE v.embedder = ? AND c.modality IN ('text', 'caption') ORDER BY c.id`, m.embedder)
 	if err != nil {
 		return err
 	}
