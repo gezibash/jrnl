@@ -135,8 +135,12 @@ over a Unix socket at `~/.journal/.run/jrnl.sock`:
 curl --unix-socket ~/.journal/.run/jrnl.sock 'http://jrnl/search?project=<name>&q=<words>&limit=5'
 ```
 
-A search takes about a millisecond on 20,000 entries, so a hook can run one on
-every prompt. It shows only clear matches, and nothing for an unrelated
+Add `format=context` for a block written for a coding agent to read: each
+entry's whole title and its text (the passage that matches, when long), how it
+matched, when and at which commit it was written, and later entries that link
+to it, such as a newer decision; `exclude=ID,ID` leaves out entries the agent
+already has. A search takes about a millisecond on 20,000 entries, so a hook
+can run one on every prompt. It shows only clear matches, and nothing for an unrelated
 question. The server runs one at a time, replaces a server of another version
 when started, frees a journal after 10 idle minutes and exits after 30.
 `jrnl search --fast` gives the same kind of answer from the command line.
