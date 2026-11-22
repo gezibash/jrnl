@@ -269,9 +269,21 @@ type gate struct{ both, alone float32 }
 // journal (2026-11-22): each shows the answer for 23 of 27 and nothing for
 // the 6. Few questions, so the margins are thin.
 var (
-	gemmaGate  = gate{0.68, 0.72} // embeddinggemma-2
-	potionGate = gate{0.34, 0.36} // potion-base-32M
+	gemmaGate = gate{0.68, 0.72} // embeddinggemma-2
+	// bge-small-en-v1.5 through jrnl serve's ranking, refitted 2026-11-22 on
+	// the same 27 questions plus 18 unrelated ones: 23 of 27 shown, 1 of 18
+	// unrelated shows a hit (potion-base-32M: 24 and 2).
+	localGate = gate{0.60, 0.60}
 )
+
+// gateFor is the gate fitted for an embedding model; models never fitted
+// get EmbeddingGemma's.
+func gateFor(model string) gate {
+	if model == localModel {
+		return localGate
+	}
+	return gemmaGate
+}
 
 func (g gate) keep(c candidate) bool {
 	both := slices.Contains(c.via, "keyword") && slices.Contains(c.via, "vector")

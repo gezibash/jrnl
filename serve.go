@@ -19,8 +19,6 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
-
-	potion "github.com/trengrj/go-potion"
 )
 
 // jrnl serve answers searches over a Unix socket from memory, the way
@@ -30,8 +28,7 @@ import (
 // Coding-agent hooks call it on every prompt.
 
 const (
-	serveModel = potion.BASE32M
-	serveIdle  = 30 * time.Minute // exit after this long without a request
+	serveIdle = 30 * time.Minute // exit after this long without a request
 	// A journal unsearched this long is closed and its index freed (about
 	// 1.2 KB an entry); the next search reloads it in about 5 ms per 1,000.
 	projectIdle = 10 * time.Minute
@@ -97,10 +94,18 @@ func cmdServe(args []string) error {
 		return err
 	}
 
-	// Downloads the model on first use (131 MB, once per machine).
-	enc, err := potion.New(context.Background(), serveModel)
+	// The embedder that wrote the journals' vectors embeds the queries. The
+	// local one is loaded, and downloaded on first use, before the socket
+	// opens; searches meanwhile find no server and do without.
+	ai, err := NewAI()
 	if err != nil {
-		return fmt.Errorf("serve: load %s: %w", serveModel, err)
+		return err
+	}
+	ai.download = true
+	if ai.local {
+		if _, err := local.load(true); err != nil {
+			return fmt.Errorf("serve: %w", err)
+		}
 	}
 	os.Remove(sock) // left by a server that was killed
 	l, err := net.Listen("unix", sock)
@@ -111,7 +116,7 @@ func cmdServe(args []string) error {
 	if err := os.Chmod(sock, 0o600); err != nil {
 		return err
 	}
-	sv := newServer(enc)
+	sv := newServer(ai)
 	srv := &http.Server{Handler: sv}
 	go func() {
 		<-sv.quit
@@ -166,7 +171,7 @@ func quitServer(sock, lockPath string) error {
 }
 
 type server struct {
-	enc      *potion.Potion
+	ai       *AI
 	mu       sync.Mutex // one search at a time: each Store has one connection
 	projects map[string]*served
 	last     time.Time
@@ -182,13 +187,16 @@ type served struct {
 	idx     *memIndex
 	version int64
 	used    time.Time
+	// backfilling: the server is embedding this journal's waiting entries.
+	backfilling bool
+	retryAt     time.Time // after a failed backfill
 }
 
-func newServer(enc *potion.Potion) *server {
-	sv := &server{enc: enc, projects: map[string]*served{}, last: time.Now(), quit: make(chan struct{})}
+func newServer(ai *AI) *server {
+	sv := &server{ai: ai, projects: map[string]*served{}, last: time.Now(), quit: make(chan struct{})}
 	sv.mux = http.NewServeMux()
 	sv.mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "jrnl %s %s\n", version, serveModel)
+		fmt.Fprintf(w, "jrnl %s %s\n", version, ai.embedModel)
 	})
 	sv.mux.HandleFunc("POST /quit", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "bye")
@@ -255,7 +263,7 @@ func (sv *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	var out strings.Builder
 	if r.URL.Query().Get("format") == "context" {
-		writeContext(&out, sv.projects[project].s, project, q, hits)
+		writeContext(&out, sv.projects[project].s, project, q, hits, gateFor(sv.ai.embedModel))
 	} else {
 		printHits(&out, hits)
 	}
@@ -269,12 +277,13 @@ func (sv *server) search(project, q string, limit int, exclude ...string) ([]Hit
 	if err != nil {
 		return nil, err
 	}
-	qvec, err := sv.enc.Encode(q)
-	if err != nil {
-		return nil, err
+	// Without a query vector (an embeddings API down) it answers by keyword.
+	var qvec []float32
+	if v, err := sv.ai.Embed([]Input{{Text: q, Query: true}}); err == nil {
+		qvec = v[0]
 	}
 	cands := slices.DeleteFunc(p.idx.rank(q, qvec), func(c candidate) bool { return slices.Contains(exclude, c.id) })
-	hits, err := p.s.hits(gateCut(cands, true, potionGate, limit))
+	hits, err := p.s.hits(gateCut(cands, qvec != nil, gateFor(sv.ai.embedModel), limit))
 	if err != nil {
 		return nil, err
 	}
@@ -328,15 +337,21 @@ func (sv *server) project(name string) (*served, error) {
 		// entry) leaves a fingerprint that differs, and rebuilds.
 		ok, err := false, error(nil)
 		if p.idx != nil {
-			if err := p.idx.addSince(p.s, sv.enc); err != nil {
+			if err := p.idx.addSince(p.s); err != nil {
 				return nil, err
 			}
 			if ok, err = p.idx.current(p.s); err != nil {
 				return nil, err
 			}
+			if ok {
+				// Vectors written since: by jrnl add, or by the backfill.
+				if err := p.idx.loadVecs(p.s); err != nil {
+					return nil, err
+				}
+			}
 		}
 		if !ok {
-			idx, err := buildMemIndex(p.s, sv.enc)
+			idx, err := buildMemIndex(p.s, sv.ai.embedID)
 			if err != nil {
 				return nil, err
 			}
@@ -344,8 +359,57 @@ func (sv *server) project(name string) (*served, error) {
 		}
 		p.version = v
 	}
+	if p.idx.missing() > 0 && !p.backfilling && time.Now().After(p.retryAt) {
+		p.backfilling = true
+		go sv.backfill(p)
+	}
 	return p, nil
 }
+
+// backfill embeds and stores the vectors a journal is waiting for, outside
+// the search lock: entries saved by an older jrnl, by another embedder, or
+// before the model was downloaded. Searches meanwhile use what is there.
+// It waits a moment first, so jrnl add stores its own entry's vector.
+func (sv *server) backfill(p *served) {
+	time.Sleep(backfillDelay)
+	defer func() {
+		sv.mu.Lock()
+		p.backfilling = false
+		// data_version moves only for other connections' commits, so the
+		// index would not see what this one stored.
+		p.version = -1
+		sv.mu.Unlock()
+	}()
+	ps, err := p.s.Pending("", sv.ai.embedID, "")
+	for start := 0; err == nil && start < len(ps); start += 16 {
+		batch := ps[start:min(start+16, len(ps))]
+		ins := make([]Input, len(batch))
+		for i, x := range batch {
+			ins[i] = x.in
+		}
+		vecs, errs := sv.ai.EmbedEach(ins)
+		for i, x := range batch {
+			switch {
+			case errs[i] == nil:
+				err = p.s.SetVec(x.chunkID, vecs[i], sv.ai.embedID)
+			case isPermanent(errs[i]):
+				err = p.s.SetError(x.chunkID, errs[i].Error())
+			default:
+				err = errs[i]
+			}
+			if err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		sv.mu.Lock()
+		p.retryAt = time.Now().Add(time.Minute)
+		sv.mu.Unlock()
+	}
+}
+
+var backfillDelay = 2 * time.Second
 
 // The context format is for a coding agent, attached to its prompt by a
 // hook: what each entry says, how well it matched, and what could make it
@@ -367,13 +431,13 @@ var (
 // writeContext writes hits as a <jrnl-recall> block, close matches in
 // meaning first, then those that only share every word of the prompt.
 // Nothing for no hits.
-func writeContext(w io.Writer, s *Store, project, q string, hits []Hit) {
+func writeContext(w io.Writer, s *Store, project, q string, hits []Hit, g gate) {
 	if len(hits) == 0 {
 		return
 	}
 	strong := func(h Hit) bool {
-		return (slices.Contains(h.Via, "keyword") && slices.Contains(h.Via, "vector") && h.Sim >= potionGate.both) ||
-			h.Sim >= potionGate.alone
+		return (slices.Contains(h.Via, "keyword") && slices.Contains(h.Via, "vector") && h.Sim >= g.both) ||
+			h.Sim >= g.alone
 	}
 	slices.SortStableFunc(hits, func(a, b Hit) int {
 		switch {
@@ -565,4 +629,23 @@ func sharedWords(q string, e Entry) []string {
 		}
 	}
 	return out
+}
+
+var startOnce sync.Once
+
+// startServer starts jrnl serve in the background, once per process, and
+// does not wait for it: it downloads the embedding model if needed and
+// embeds the entries that waited for it.
+func startServer() {
+	startOnce.Do(func() {
+		exe, err := os.Executable()
+		if err != nil {
+			return
+		}
+		cmd := exec.Command(exe, "serve", "--background")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if cmd.Start() == nil {
+			go cmd.Wait()
+		}
+	})
 }

@@ -8,25 +8,31 @@ import (
 	"strings"
 	"sync"
 	"unicode"
-
-	potion "github.com/trengrj/go-potion"
 )
 
 // memIndex is everything jrnl serve searches, in memory, the way Typesense
-// keeps its index: one static (potion) vector per entry and an inverted
-// index of its words for BM25. SQLite's FTS5 took 20 ms to score a common
-// query over 20,000 entries (42 ms with snippets); this takes about 1 ms.
+// keeps its index: an inverted index of each entry's words for BM25, and the
+// vectors stored for its text and attachment captions. SQLite's FTS5 took
+// 20 ms to score a common query over 20,000 entries (42 ms with snippets);
+// this takes about 1 ms.
 type memIndex struct {
 	ids      []string
-	dim      int
-	vecs     []int8    // entry i's vector is vecs[i*dim : (i+1)*dim] times scale[i]
-	scale    []float32 // int8 keeps a quarter of float32's memory; cosine moves < 0.01
 	postings map[string][]posting
 	docLen   []int32
 	norm     []float32 // BM25's length factor per entry: k1*(1-b+b*len/avg)
 	totalLen int64
 	maxRowid int64 // the keyword table's last row, to add new entries alone
 	textLen  int64 // characters indexed, as SQL length() counts them
+
+	// Vectors made by embedder, several per entry (its text, each caption):
+	// row i belongs to entry vecDoc[i] and is vecs[i*dim:(i+1)*dim] times
+	// scale[i]. int8 keeps a quarter of float32's memory; cosine moves < 0.01.
+	embedder string
+	dim      int
+	vecs     []int8
+	scale    []float32
+	vecDoc   []int32
+	has      []bool // entry has a vector; one without waits for backfill
 }
 
 const bm25k1, bm25b = 1.2, 0.75
@@ -40,15 +46,16 @@ type posting struct {
 	tf  int32
 }
 
-// buildMemIndex indexes every entry's searchable text: what the keyword
-// table holds (title, body, tags, attachment descriptions).
-func buildMemIndex(s *Store, enc *potion.Potion) (*memIndex, error) {
-	m := &memIndex{postings: map[string][]posting{}}
-	return m, m.addSince(s, enc)
+// buildMemIndex indexes every entry's searchable text, what the keyword
+// table holds (title, body, tags, attachment descriptions), and loads the
+// vectors embedder stored for them.
+func buildMemIndex(s *Store, embedder string) (*memIndex, error) {
+	m := &memIndex{postings: map[string][]posting{}, embedder: embedder}
+	return m, m.addSince(s)
 }
 
 // addSince adds the keyword rows written after the last one indexed.
-func (m *memIndex) addSince(s *Store, enc *potion.Potion) error {
+func (m *memIndex) addSince(s *Store) error {
 	rows, err := s.db.Query(`SELECT rowid, entry_id, title, body, tags, captions,
 		length(entry_id)+length(title)+length(body)+length(tags)+length(captions)
 		FROM entries_fts WHERE rowid > ? ORDER BY rowid`, m.maxRowid)
@@ -74,39 +81,80 @@ func (m *memIndex) addSince(s *Store, enc *potion.Potion) error {
 	if len(texts) == 0 {
 		return nil
 	}
-
-	// Embedding and tokenizing are independent; both use every core.
-	var vecs [][]float32
-	var encErr error
-	done := make(chan struct{})
-	go func() {
-		vecs, encErr = enc.EncodeMany(texts)
-		close(done)
-	}()
 	docs := make([]docTerms, len(texts))
 	parallel(len(texts), func(i int) { docs[i] = countTerms(texts[i]) })
-	<-done
-	if encErr != nil {
-		return encErr
-	}
-
 	for i, d := range docs {
 		doc := int32(len(m.ids))
 		m.ids = append(m.ids, ids[i])
+		m.has = append(m.has, false)
 		for j, t := range d.terms {
 			m.postings[t] = append(m.postings[t], posting{doc, d.tf[j]})
 		}
 		m.docLen = append(m.docLen, d.n)
 		m.totalLen += int64(d.n)
-		m.dim = len(vecs[i])
-		m.vecs, m.scale = appendInt8(m.vecs, m.scale, vecs[i])
 	}
 	avg := float64(m.totalLen) / float64(len(m.ids))
 	m.norm = make([]float32, len(m.ids))
 	for i, n := range m.docLen {
 		m.norm[i] = float32(bm25k1 * (1 - bm25b + bm25b*float64(n)/avg))
 	}
-	return nil
+	return m.loadVecs(s)
+}
+
+// loadVecs reads the stored vectors of the entries that have none yet.
+func (m *memIndex) loadVecs(s *Store) error {
+	want := map[string]int32{}
+	for doc, ok := range m.has {
+		if !ok {
+			want[m.ids[doc]] = int32(doc)
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	rows, err := s.db.Query(`SELECT entry_id, vec FROM chunks
+		WHERE embedder = ? AND vec IS NOT NULL AND modality IN ('text', 'caption') ORDER BY id`, m.embedder)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := map[int32]bool{}
+	for rows.Next() {
+		var id string
+		var blob []byte
+		if err := rows.Scan(&id, &blob); err != nil {
+			return err
+		}
+		doc, ok := want[id]
+		if !ok {
+			continue
+		}
+		v := decodeVec(blob)
+		if m.dim == 0 {
+			m.dim = len(v)
+		}
+		if len(v) != m.dim {
+			continue
+		}
+		m.vecs, m.scale = appendInt8(m.vecs, m.scale, v)
+		m.vecDoc = append(m.vecDoc, doc)
+		found[doc] = true
+	}
+	for doc := range found {
+		m.has[doc] = true
+	}
+	return rows.Err()
+}
+
+// missing counts the entries with no vector yet.
+func (m *memIndex) missing() int {
+	n := 0
+	for _, ok := range m.has {
+		if !ok {
+			n++
+		}
+	}
+	return n
 }
 
 // docTerms are an entry's distinct terms with their counts, and its length.
@@ -324,12 +372,22 @@ func (m *memIndex) rank(q string, qvec []float32) []candidate {
 	return cands
 }
 
-// similarities is the dot product of q with every entry's vector, split
-// across the cores: 20,000 x 512 is 10 million multiplications.
+// similarities is each entry's best cosine with q over its vectors, the
+// dot products split across the cores: 20,000 x 384 is 8 million
+// multiplications.
 func (m *memIndex) similarities(q []float32) []float32 {
 	sims := make([]float32, len(m.ids))
+	if m.dim == 0 {
+		return sims
+	}
 	q8, qs := appendInt8(nil, nil, q)
-	parallel(len(m.ids), func(i int) { sims[i] = qs[0] * m.scale[i] * float32(dot8(q8, m.vecs[i*m.dim:(i+1)*m.dim])) })
+	rowSims := make([]float32, len(m.vecDoc))
+	parallel(len(m.vecDoc), func(i int) {
+		rowSims[i] = qs[0] * m.scale[i] * float32(dot8(q8, m.vecs[i*m.dim:(i+1)*m.dim]))
+	})
+	for i, doc := range m.vecDoc {
+		sims[doc] = max(sims[doc], rowSims[i])
+	}
 	return sims
 }
 

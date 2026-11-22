@@ -9,7 +9,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	potion "github.com/trengrj/go-potion"
 	"io"
 	"net"
 	"net/http"
@@ -321,7 +320,10 @@ func (e *env) run(stdin string, args ...string) (string, string, error) {
 		"TZ=Europe/Berlin", "JRNL_NOW=2026-11-19T15:30:00+01:00", "CLAUDECODE=", "CLAUDE_CODE_SESSION_ID=sess-1")
 	// This machine's own settings must not leak in.
 	cmd.Env = append(cmd.Env, "JRNL_CHAT_URL="+e.url+"/v1", "JRNL_CHAT_KEY=chat-test", "JRNL_CHAT_MODEL=test/vision",
-		"JRNL_CHAT_EXTRA=", "JRNL_EMBED_URL=", "JRNL_EMBED_KEY=", "JRNL_EMBED_MODEL=",
+		// Embeddings from the fake, set up as Ollama at OLLAMA_HOST would be;
+		// the local model is out of reach unless a test opts in.
+		"JRNL_CHAT_EXTRA=", "JRNL_EMBED_URL="+e.ollama+"/v1", "JRNL_EMBED_KEY=", "JRNL_EMBED_MODEL=embeddinggemma-2:270m",
+		"JRNL_MODEL_DIR="+filepath.Join(e.home, "no-model"), "JRNL_MODELS_URL=http://127.0.0.1:1",
 		"JRNL_RERANK_URL=", "JRNL_RERANK_KEY=", "JRNL_RERANK_MODEL=", "JRNL_ENV_FILE="+filepath.Join(e.home, "no-env-file"),
 		"JRNL_TEST_CF_KEY=cf-test")
 	conf := filepath.Join(e.home, "config.toml")
@@ -674,55 +676,44 @@ func TestSearchDoesNotWaitOnSlowReranker(t *testing.T) {
 	}
 }
 
-// With Ollama down, entries are still saved and search still answers by
-// keyword; once Ollama is back, reindex makes them findable by meaning.
-// There is no silent fallback to another embedder. On a journal Ollama has
-// never embedded, that is a machine without Ollama and jrnl stays quiet; once
-// Ollama has been used, losing it is reported.
-func TestOllamaDown(t *testing.T) {
+// With the embeddings API down, entries are still saved and search answers
+// by keyword, saying so; once it is back, reindex makes them findable by
+// meaning. There is no silent fallback to another embedder.
+func TestEmbedderDown(t *testing.T) {
 	e := newEnv(t)
-	e.ollama = "http://127.0.0.1:1" // nothing listens here
-	e.path = t.TempDir()            // and no ollama binary is installed
+	e.ollama = "http://127.0.0.1:1" // nothing listens at the embeddings URL
 	out, errOut, err := e.run("Login form rejects valid credentials.", "add")
 	if err != nil {
-		t.Fatalf("add failed with Ollama down: %v\n%s", err, errOut)
+		t.Fatalf("add failed with the embedder down: %v\n%s", err, errOut)
 	}
 	id := firstID(out)
-	if errOut != "" {
-		t.Errorf("add without Ollama ever set up should be quiet: %q", errOut)
+	if !strings.Contains(errOut, "reindex") {
+		t.Errorf("add should say to reindex later: %q", errOut)
 	}
 	out, errOut, _ = e.run("", "search", "Login")
-	if !strings.HasPrefix(out, id) || !strings.Contains(out, "(keyword)") || errOut != "" {
-		t.Errorf("search should answer by keyword, quietly; stderr %q:\n%s", errOut, out)
+	if !strings.HasPrefix(out, id) || !strings.Contains(errOut, "keyword search only") {
+		t.Errorf("search should answer by keyword and say so; stderr %q:\n%s", errOut, out)
 	}
 
 	e.ollama = e.url
 	if out := e.must("", "reindex"); !strings.Contains(out, "embedded 1 ") {
-		t.Fatalf("reindex after Ollama came back: %q", out)
+		t.Fatalf("reindex after the embedder came back: %q", out)
 	}
 	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) {
 		t.Fatalf("not findable by meaning after reindex:\n%s", out)
 	}
-
-	e.ollama = "http://127.0.0.1:1" // set up, now broken
-	_, errOut, _ = e.run("Second entry.", "add")
-	if !strings.Contains(errOut, "ollama") || !strings.Contains(errOut, "reindex") {
-		t.Errorf("add should say Ollama is down and to reindex: %q", errOut)
-	}
-	out, errOut, _ = e.run("", "search", "Login")
-	if !strings.HasPrefix(out, id) || !strings.Contains(errOut, "keyword search only") {
-		t.Errorf("search should warn it fell back to keywords; stderr %q:\n%s", errOut, out)
-	}
 }
 
-// A fresh install has no Ollama and no chat model. jrnl must work without a
-// word of setup noise, say how to get more only when it matters, and index
+// A fresh install has the built-in embedding model not yet downloaded (and
+// here it cannot be: no network), and no chat model. jrnl must work without
+// a word of setup noise, say how to get more only when it matters, and index
 // everything saved meanwhile once the parts are turned on.
 func TestFreshInstall(t *testing.T) {
 	e := newEnv(t)
 	media := e.config
-	e.ollama, e.noChat, e.config = "http://127.0.0.1:1", true, ""
-	e.path = t.TempDir() // a machine with none of the optional tools
+	e.noChat, e.config = true, ""
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL="} // the built-in model, not downloaded
+	e.path = t.TempDir()                                       // a machine with none of the optional tools
 	img := filepath.Join(t.TempDir(), "shot.png")
 	os.WriteFile(img, []byte("\x89PNG settings page"), 0o644)
 
@@ -731,9 +722,9 @@ func TestFreshInstall(t *testing.T) {
 	if err != nil || errOut != "" {
 		t.Fatalf("add should work quietly: %v, stderr %q", err, errOut)
 	}
-	// A refused connection is not retried: backoff would cost 7 s per add.
+	// add never waits for the download.
 	if d := time.Since(start); d > 3*time.Second {
-		t.Errorf("add without Ollama took %s", d)
+		t.Errorf("add without the model took %s", d)
 	}
 	id := firstID(out)
 	out, errOut, err = e.run("Settings page layout.", "add", "--attach", img)
@@ -754,7 +745,7 @@ func TestFreshInstall(t *testing.T) {
 	}
 	doc := e.must("", "doctor")
 	// Waiting: the text of both entries, and the image's description.
-	for _, want := range []string{"2 entries", "3 item(s) waiting", "embedding  off", "chat       off", "JRNL_CHAT_URL"} {
+	for _, want := range []string{"2 entries", "3 item(s) waiting", "embedding  off", "jrnl reindex", "chat       off", "JRNL_CHAT_URL"} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("doctor is missing %q:\n%s", want, doc)
 		}
@@ -771,20 +762,16 @@ func TestFreshInstall(t *testing.T) {
 		t.Errorf("audio without ffmpeg should stay waiting:\n%s", doc)
 	}
 
-	// Ollama installed but not running: say so, it is one command away.
-	bin := t.TempDir()
-	os.WriteFile(filepath.Join(bin, "ollama"), []byte("#!/bin/sh\n"), 0o755)
-	e.path = bin
-	if _, errOut, _ := e.run("Third entry.", "add"); !strings.Contains(errOut, "ollama serve") {
-		t.Errorf("with Ollama installed but stopped, add should say so: %q", errOut)
+	// Offline, reindex says why the model is missing and saves nothing wrong.
+	if _, errOut, _ := e.run("", "reindex"); !strings.Contains(errOut, "download") {
+		t.Errorf("reindex should say the download failed: %q", errOut)
 	}
-	e.path = t.TempDir()
 
-	// Ollama only: search by meaning, and no complaint about reranking.
-	e.ollama = e.url
+	// An embeddings API set up: search by meaning, and no complaint about reranking.
+	e.extra = nil
 	e.must("", "reindex")
 	if out, errOut, _ := e.run("", "search", "authentication problem"); !strings.HasPrefix(out, id) || errOut != "" {
-		t.Errorf("with Ollama on, search by meaning should work quietly; stderr %q:\n%s", errOut, out)
+		t.Errorf("with embeddings on, search by meaning should work quietly; stderr %q:\n%s", errOut, out)
 	}
 
 	// A chat model and a media embedder too: the attachment saved before
@@ -1320,7 +1307,7 @@ extra    = { reasoning_effort = "low", kwargs = { thinking = false } }
 		t.Errorf("the config's key went to the URL set by JRNL_CHAT_URL: %v", got)
 	}
 
-	e.extra = nil
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL="} // the config's embedder, not the test default
 	for conf, want := range map[string]string{
 		"[providers.gw]\nurl = \"x\"\nkey = \"sk-123\"\n[chat]\nprovider = \"gw\"\nmodel = \"m\"\n":           "env:",
 		"[chat]\nprovider = \"gw\"\nmodle = \"m\"\n":                                                          "unknown setting",
@@ -1338,6 +1325,7 @@ extra    = { reasoning_effort = "low", kwargs = { thinking = false } }
 func TestConfigAndEnvNameTheSameEmbedder(t *testing.T) {
 	e := newEnv(t)
 	e.config = "[providers.o]\nurl = \"" + e.url + "/v1\"\n[embed]\nprovider = \"o\"\nmodel = \"emb-x\"\n"
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL="} // the config's embedder, not the test default
 	id := firstID(e.must("Login form rejects valid credentials.", "add"))
 	e.config = ""
 	e.extra = []string{"JRNL_EMBED_URL=" + e.url + "/v1", "JRNL_EMBED_MODEL=emb-x"}
@@ -1476,10 +1464,7 @@ func TestProjectBranchAndCommitFromGit(t *testing.T) {
 // for a project it is asked about. Uses the real potion model, so it runs
 // only where the model is cached.
 func TestServe(t *testing.T) {
-	cache, _ := os.UserCacheDir()
-	if _, err := os.Stat(filepath.Join(cache, "go-potion", "BASE32M", "model.safetensors")); err != nil {
-		t.Skip("potion BASE32M not cached; run jrnl serve once to fetch it")
-	}
+	needLocalModel(t)
 	e := newEnv(t)
 	// A short home: a Unix socket path has a 104-byte limit on macOS.
 	home, err := os.MkdirTemp("/tmp", "jrs")
@@ -1488,11 +1473,13 @@ func TestServe(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(home) })
 	e.home = home
+	// The command line embeds with the local model, as the server does.
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + localDir()}
 	login := firstID(e.must("Users could not sign in after the token refresh.", "add", "--kind", "bug"))
 	goBun := firstID(e.must("Chose Go over Bun for the CLI.", "add", "--kind", "decision"))
 
 	srv := exec.Command(bin, "serve")
-	srv.Env = append(os.Environ(), "JRNL_HOME="+home)
+	srv.Env = serveEnv(home)
 	if err := srv.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -1572,10 +1559,7 @@ func TestServe(t *testing.T) {
 // another added: SQLite then reuses the deleted row's number, so the new
 // row is not "after the last one indexed" and the count is unchanged.
 func TestServeIndexAfterDeletingNewest(t *testing.T) {
-	cache, _ := os.UserCacheDir()
-	if _, err := os.Stat(filepath.Join(cache, "go-potion", "BASE32M", "model.safetensors")); err != nil {
-		t.Skip("potion BASE32M not cached")
-	}
+	ai := localTestAI(t)
 	t.Setenv("JRNL_HOME", t.TempDir())
 	s, err := Open("p")
 	if err != nil {
@@ -1583,18 +1567,17 @@ func TestServeIndexAfterDeletingNewest(t *testing.T) {
 	}
 	add := func(body string) string {
 		e := Entry{ID: newID(), TS: time.Now().UTC().Format(time.RFC3339), Project: "p", Kind: "note", Title: firstLine(body), Body: body}
-		if err := s.Insert(e, nil); err != nil {
+		if err := s.Insert(e, []Chunk{{Modality: "text"}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := process(s, ai, e.ID, true); err != nil {
 			t.Fatal(err)
 		}
 		return e.ID
 	}
 	add("Chose Go over Bun for the CLI.")
 	old := add("Payments failed when the customer's card had expired.")
-	enc, err := potion.New(context.Background(), serveModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sv := newServer(enc)
+	sv := newServer(ai)
 	if _, err := sv.search("p", "expired card payments failed", 5); err != nil {
 		t.Fatal(err)
 	}
@@ -1616,10 +1599,7 @@ func TestServeIndexAfterDeletingNewest(t *testing.T) {
 // one searched since stays, and the next search of the dropped one reloads
 // it with whatever was written meanwhile.
 func TestServeUnloadsIdleJournals(t *testing.T) {
-	cache, _ := os.UserCacheDir()
-	if _, err := os.Stat(filepath.Join(cache, "go-potion", "BASE32M", "model.safetensors")); err != nil {
-		t.Skip("potion BASE32M not cached")
-	}
+	ai := localTestAI(t)
 	t.Setenv("JRNL_HOME", t.TempDir())
 	add := func(project, body string) string {
 		s, err := Open(project)
@@ -1628,18 +1608,17 @@ func TestServeUnloadsIdleJournals(t *testing.T) {
 		}
 		defer s.Close()
 		e := Entry{ID: newID(), TS: time.Now().UTC().Format(time.RFC3339), Project: project, Kind: "note", Title: firstLine(body), Body: body}
-		if err := s.Insert(e, nil); err != nil {
+		if err := s.Insert(e, []Chunk{{Modality: "text"}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := process(s, ai, e.ID, true); err != nil {
 			t.Fatal(err)
 		}
 		return e.ID
 	}
 	add("idle", "Chose Go over Bun for the CLI.")
 	add("busy", "Users could not sign in after the token refresh.")
-	enc, err := potion.New(context.Background(), serveModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sv := newServer(enc)
+	sv := newServer(ai)
 	if _, err := sv.search("idle", "why go over bun", 5); err != nil {
 		t.Fatal(err)
 	}
@@ -1668,17 +1647,14 @@ func TestServeUnloadsIdleJournals(t *testing.T) {
 // one unreachable and holding the model until it idled out; and a server
 // of an older version kept answering after an upgrade.
 func TestServeOneServerOfTheCurrentVersion(t *testing.T) {
-	cache, _ := os.UserCacheDir()
-	if _, err := os.Stat(filepath.Join(cache, "go-potion", "BASE32M", "model.safetensors")); err != nil {
-		t.Skip("potion BASE32M not cached")
-	}
+	needLocalModel(t)
 	home, err := os.MkdirTemp("/tmp", "jrs") // a socket path is limited to 104 bytes
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(home) })
 	sock := filepath.Join(home, ".run", "jrnl.sock")
-	env := append(os.Environ(), "JRNL_HOME="+home)
+	env := serveEnv(home)
 	health := func() string {
 		r, err := socketClient(sock).Get("http://jrnl/health")
 		if err != nil {
@@ -1754,10 +1730,7 @@ func TestServeOneServerOfTheCurrentVersion(t *testing.T) {
 // may replace it); a close note shown once, under the entry it closed; text
 // that cannot break the block; nothing for an unrelated prompt.
 func TestServeContextFormat(t *testing.T) {
-	cache, _ := os.UserCacheDir()
-	if _, err := os.Stat(filepath.Join(cache, "go-potion", "BASE32M", "model.safetensors")); err != nil {
-		t.Skip("potion BASE32M not cached")
-	}
+	ai := localTestAI(t)
 	t.Setenv("JRNL_HOME", t.TempDir())
 	s, err := Open("p")
 	if err != nil {
@@ -1770,7 +1743,10 @@ func TestServeContextFormat(t *testing.T) {
 		if len(e.Title) > 80 {
 			e.Title = e.Title[:77] + "…" // as jrnl add stores it
 		}
-		if err := s.Insert(e, nil); err != nil {
+		if err := s.Insert(e, []Chunk{{Modality: "text"}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := process(s, ai, e.ID, true); err != nil {
 			t.Fatal(err)
 		}
 		return e.ID
@@ -1783,11 +1759,7 @@ func TestServeContextFormat(t *testing.T) {
 	todo := add("todo", "Rotate the staging database password before the audit")
 	closed := add("log", "Closed: Rotate the staging database password before the audit\n\nRotated on Monday.", todo)
 
-	enc, err := potion.New(context.Background(), serveModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sv := newServer(enc)
+	sv := newServer(ai)
 	get := func(q string, exclude ...string) string {
 		rec := httptest.NewRecorder()
 		v := url.Values{"project": {"p"}, "q": {q}, "format": {"context"}}
@@ -1935,5 +1907,96 @@ func TestUpgradeTypesLinks(t *testing.T) {
 	closedBy := note[strings.Index(note, "closed_by: ")+len("closed_by: "):][:26]
 	if types[closedBy] != "closes" || types[other] != "relates" || len(types) != 2 {
 		t.Errorf("want the close note's link closes and the other relates, got %v", types)
+	}
+}
+
+// needLocalModel skips where the local embedding model is not downloaded.
+func needLocalModel(t testing.TB) {
+	t.Helper()
+	if !localDownloaded() {
+		t.Skip("the local embedding model is not downloaded; run jrnl reindex once")
+	}
+}
+
+// localTestAI embeds with the real local model and nothing else.
+func localTestAI(t testing.TB) *AI {
+	t.Helper()
+	needLocalModel(t)
+	return &AI{local: true, embedModel: localModel, embedID: localID, hc: http.DefaultClient, attempts: 1,
+		from: map[string]string{}, chatErr: errNoChat, mediaErr: errNoMediaEmbed}
+}
+
+// serveEnv runs jrnl serve on home with the local model and none of this
+// machine's settings.
+func serveEnv(home string) []string {
+	return append(os.Environ(), "JRNL_HOME="+home, "JRNL_CONFIG="+filepath.Join(home, "no-config.toml"),
+		"JRNL_ENV_FILE="+filepath.Join(home, "no-env"), "JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR="+localDir())
+}
+
+// With no embeddings API set up, jrnl embeds in its own process: a reworded
+// question finds the entry, and doctor says where the model is. Uses the
+// real model, so it runs only where it is downloaded.
+func TestBuiltInEmbedder(t *testing.T) {
+	needLocalModel(t)
+	e := newEnv(t)
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + localDir()}
+	login := firstID(e.must("Users could not sign in after the token refresh.", "add"))
+	e.must("Chose Go over Bun for the CLI.", "add", "--kind", "decision")
+	if out := e.must("", "search", "--fast", "why do logins fail after refreshing credentials"); !strings.HasPrefix(out, login) {
+		t.Errorf("a reworded question should find the sign-in entry first:\n%s", out)
+	}
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "bge-small-en-v1.5 in this binary") || strings.Contains(doc, "waiting") {
+		t.Errorf("doctor should show the built-in model with nothing waiting:\n%s", doc)
+	}
+}
+
+// Entries with no vector from the server's embedder (saved by an older
+// jrnl, by another embedder, or before the model was downloaded) are
+// embedded by jrnl serve in the background and stored, and found by
+// meaning once they are.
+func TestServeBackfill(t *testing.T) {
+	ai := localTestAI(t)
+	t.Setenv("JRNL_HOME", t.TempDir())
+	backfillDelay = 0
+	t.Cleanup(func() { backfillDelay = 2 * time.Second })
+	s, err := Open("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login := Entry{ID: newID(), TS: time.Now().UTC().Format(time.RFC3339), Project: "p", Kind: "bug",
+		Title: "Users could not sign in after the token refresh", Body: "Users could not sign in after the token refresh"}
+	other := Entry{ID: newID(), TS: time.Now().UTC().Format(time.RFC3339), Project: "p", Kind: "decision",
+		Title: "Chose Go over Bun for the CLI", Body: "Chose Go over Bun for the CLI"}
+	for _, e := range []Entry{login, other} {
+		if err := s.Insert(e, []Chunk{{Modality: "text"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One of them has a vector, from an embedder the server does not use.
+	if _, err := s.db.Exec(`UPDATE chunks SET vec = ?, embedder = 'old-model@elsewhere' WHERE entry_id = ?`,
+		encodeVec(make([]float32, 8)), other.ID); err != nil {
+		t.Fatal(err)
+	}
+	sv := newServer(ai)
+	q := "why do logins fail after refreshing credentials"
+	for i := 0; ; i++ {
+		sv.mu.Lock()
+		hits, err := sv.search("p", q, 5)
+		sv.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hits) > 0 && hits[0].Entry.ID == login.ID && slices.Contains(hits[0].Via, "vector") {
+			break
+		}
+		if i == 100 {
+			t.Fatalf("not found by meaning after 5 s of backfill: %v", hits)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var n int
+	s.db.QueryRow(`SELECT count(*) FROM chunks WHERE embedder = ? AND vec IS NOT NULL`, localID).Scan(&n)
+	if n != 2 {
+		t.Errorf("want both entries' vectors stored by the server's embedder, got %d", n)
 	}
 }

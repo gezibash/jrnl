@@ -640,7 +640,7 @@ func cmdSearch(args []string) error {
 		}
 	}
 	if *fast && *like == "" && order == "" {
-		g := gemmaGate
+		g := gateFor(ai.embedModel)
 		if *minScore >= 0 {
 			g = gate{float32(*minScore), float32(*minScore)}
 		}
@@ -722,6 +722,7 @@ func cmdReindex(args []string) error {
 	if err != nil {
 		return err
 	}
+	ai.download = true // reindex is how the embedding model gets downloaded
 	r, err := process(s, ai, "", false)
 	if err != nil {
 		return err
@@ -1136,16 +1137,12 @@ func cmdDoctor(args []string) error {
 		}
 	}
 	row("parakeet", parakeetOn, "transcripts of audio and video", how)
-	cache, _ := os.UserCacheDir()
-	_, modelErr := os.Stat(filepath.Join(cache, "go-potion", string(serveModel), "model.safetensors"))
-	how = "run `jrnl serve --background`; the first start downloads a 131 MB model, once per machine"
-	if modelErr == nil {
-		how = "model " + string(serveModel) + " downloaded; server not running"
-		if v, ok := runningVersion(socketPath()); ok {
-			how = "model " + string(serveModel) + "; server " + v + " running at " + socketPath()
-		}
+	running, ok := runningVersion(socketPath())
+	how = "`jrnl serve --background`; jrnl add starts it when entries wait for the embedding model"
+	if ok {
+		how = "server " + running + " running at " + socketPath()
 	}
-	row("serve", modelErr == nil, "searches in about a millisecond, for coding-agent hooks", how)
+	row("serve", ok, "searches from memory in milliseconds, for coding-agent hooks", how)
 	if waiting > 0 {
 		fmt.Println("\nAfter turning a part on, run `jrnl reindex` to index what was saved before.")
 	}
@@ -1154,7 +1151,13 @@ func cmdDoctor(args []string) error {
 
 // embedStatus embeds one word, which works the same on every provider.
 func embedStatus(ai *AI) (bool, string) {
+	if ai.local && !localDownloaded() {
+		return false, "run `jrnl reindex` once: it downloads " + localModel + " (" + localSize + ") and embeds what waited"
+	}
 	_, err := ai.Interactive(10 * time.Second).embedText([]string{"jrnl doctor"})
+	if err == nil && ai.local {
+		return true, localModel + " in this binary (" + localDir() + ")"
+	}
 	if err == nil {
 		return true, ai.embedModel + " at " + ai.embedURL
 	}

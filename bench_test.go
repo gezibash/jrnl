@@ -4,7 +4,6 @@ package main
 // go test -run '^$' -bench . -benchmem -count 6 | tee new.txt; benchstat old.txt new.txt
 
 import (
-	"context"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -13,8 +12,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	potion "github.com/trengrj/go-potion"
 )
 
 const benchEntries = 20_000
@@ -47,20 +44,20 @@ func benchText(r *rand.Rand, n int) string {
 // benchServer builds the journal once per run, under a temporary home.
 func benchServer(b *testing.B) *server {
 	b.Helper()
-	cache, _ := os.UserCacheDir()
-	if _, err := os.Stat(filepath.Join(cache, "go-potion", string(serveModel), "model.safetensors")); err != nil {
-		b.Skip("potion model not cached")
-	}
+	ai := localTestAI(b)
 	benchOnce.Do(func() {
-		home, err := os.MkdirTemp("", "jrnl-bench")
+		// Kept between runs: embedding 20,000 entries takes minutes.
+		home := filepath.Join(os.TempDir(), "jrnl-bench-"+localID[len(localModel)+7:])
+		os.Setenv("JRNL_HOME", home)
+		_, statErr := os.Stat(filepath.Join(home, "bench", "journal.db"))
+		s, err := Open("bench")
 		if err != nil {
 			benchErr = err
 			return
 		}
-		os.Setenv("JRNL_HOME", home)
-		s, err := Open("bench")
-		if err != nil {
-			benchErr = err
+		defer s.Close()
+		if statErr == nil {
+			benchSrv = newServer(ai)
 			return
 		}
 		r := rand.New(rand.NewPCG(1, 2))
@@ -69,18 +66,16 @@ func benchServer(b *testing.B) *server {
 			title := benchText(r, 8)
 			e := Entry{ID: newID(), TS: ts.Add(time.Duration(i) * time.Minute).Format(time.RFC3339), Project: "bench",
 				Kind: "note", Title: title, Body: title + "\n\n" + benchText(r, 40+r.IntN(80))}
-			if err := s.Insert(e, nil); err != nil {
+			if err := s.Insert(e, []Chunk{{Modality: "text"}}); err != nil {
 				benchErr = err
 				return
 			}
 		}
-		s.Close()
-		enc, err := potion.New(context.Background(), serveModel)
-		if err != nil {
+		if _, err := process(s, ai, "", true); err != nil {
 			benchErr = err
 			return
 		}
-		benchSrv = newServer(enc)
+		benchSrv = newServer(ai)
 	})
 	if benchErr != nil {
 		b.Fatal(benchErr)
@@ -114,7 +109,7 @@ func BenchmarkServeSearch(b *testing.B) {
 func BenchmarkEncodeQuery(b *testing.B) {
 	sv := benchServer(b)
 	for i := 0; b.Loop(); i++ {
-		sv.enc.Encode(benchQueries[i%len(benchQueries)])
+		sv.ai.Embed([]Input{{Text: benchQueries[i%len(benchQueries)], Query: true}})
 	}
 }
 
@@ -126,7 +121,11 @@ func BenchmarkRank(b *testing.B) {
 	}
 	vecs := make([][]float32, len(benchQueries))
 	for i, q := range benchQueries {
-		vecs[i], _ = sv.enc.Encode(q)
+		v, err := sv.ai.Embed([]Input{{Text: q, Query: true}})
+		if err != nil {
+			b.Fatal(err)
+		}
+		vecs[i] = v[0]
 	}
 	for i := 0; b.Loop(); i++ {
 		p.idx.rank(benchQueries[i%len(benchQueries)], vecs[i%len(vecs)])
@@ -141,7 +140,7 @@ func BenchmarkIndexBuild(b *testing.B) {
 		b.Fatal(err)
 	}
 	for b.Loop() {
-		if _, err := buildMemIndex(p.s, sv.enc); err != nil {
+		if _, err := buildMemIndex(p.s, sv.ai.embedID); err != nil {
 			b.Fatal(err)
 		}
 	}

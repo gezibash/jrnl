@@ -66,6 +66,15 @@ func format(model string, in Input) string {
 	m := strings.ToLower(model)
 	var t string
 	switch {
+	case m == localModel:
+		t = in.Title + "\n\n" + in.Text
+		if in.Query {
+			t = localQueryPrefix + in.Text
+		}
+		if len(t) > localMaxChars {
+			t = strings.ToValidUTF8(t[:localMaxChars], "")
+		}
+		return t
 	case strings.Contains(m, "embeddinggemma"):
 		t = "title: " + in.Title + " | text: " + in.Text
 		if in.Query {
@@ -98,7 +107,10 @@ func format(model string, in Input) string {
 //   - media vectors (search --like by look): Cloudflare Workers AI's own API.
 type AI struct {
 	embedURL, embedKey, embedModel, embedID string
-	embedSet                                bool // set by config or JRNL_EMBED_URL, not the Ollama default
+	embedSet                                bool // set by config or JRNL_EMBED_URL, not a default
+	// local: no embeddings API is set up, so bge-small runs in this process.
+	// download: this command may download its model (reindex, serve).
+	local, download bool
 
 	chatURL, chatKey, chatModel string
 
@@ -135,7 +147,8 @@ func (e *AI) Interactive(deadline time.Duration) *AI {
 //
 //	(see config.go for config.toml; these variables override it)
 //	JRNL_EMBED_URL, JRNL_EMBED_KEY, JRNL_EMBED_MODEL  text embeddings
-//	    (default: Ollama at OLLAMA_HOST or localhost:11434, embeddinggemma-2)
+//	    (default: bge-small-en-v1.5 in this process; a model with no URL
+//	    means Ollama at OLLAMA_HOST or localhost:11434)
 //	JRNL_CHAT_URL, JRNL_CHAT_KEY, JRNL_CHAT_MODEL     chat
 //	JRNL_CHAT_EXTRA                                   JSON fields added to each chat request
 //	JRNL_RERANK_URL, JRNL_RERANK_KEY, JRNL_RERANK_MODEL  a reranker with a
@@ -234,13 +247,16 @@ func NewAI() (*AI, error) {
 		return nil, err
 	}
 	e.embedURL, e.embedKey, e.embedModel, e.embedSet = emb.url, emb.key, emb.model, emb.url != ""
-	if !e.embedSet {
+	switch {
+	case !e.embedSet && e.embedModel == "":
+		e.local, e.embedModel, e.embedID = true, localModel, localID
+	case !e.embedSet:
 		e.embedURL = ollamaURL()
+		fallthrough
+	default:
+		e.embedID = embedderID(e.embedURL, e.embedModel)
 	}
-	if e.embedModel == "" {
-		e.embedModel = ollamaModel
-	}
-	e.embedID, e.from["embed"] = embedderID(e.embedURL, e.embedModel), emb.from
+	e.from["embed"] = emb.from
 
 	chat, err := c.resolve("chat", c.Chat, "CHAT")
 	if err != nil {
@@ -383,6 +399,14 @@ func messageContent(in Input) (any, error) {
 }
 
 func (e *AI) embedText(input []string) ([][]float32, error) {
+	if e.local {
+		vecs, err := local.embed(input, e.download)
+		if errors.Is(err, errNoModel) {
+			// jrnl serve downloads the model and embeds what waited.
+			startServer()
+		}
+		return vecs, err
+	}
 	body, _ := json.Marshal(map[string]any{"model": e.embedModel, "input": input})
 	var res struct {
 		Data []struct {
