@@ -19,6 +19,7 @@ const (
 type Hit struct {
 	Entry   Entry
 	Score   float64
+	Sim     float32  // meaning score: cosine of the best vector match, 0 for keyword only
 	Via     []string // "keyword", "vector"
 	Snippet string
 	Match   string // which piece matched by vector: "text" or an attachment
@@ -64,6 +65,7 @@ func (s *Store) Search(q string, qvec []float32, embedder string, modalities []s
 	via := map[string][]string{}
 	snippets := map[string]string{}
 	match := map[string]string{}
+	sims := map[string]float32{}
 
 	sortBy := "bm25(entries_fts)"
 	switch order {
@@ -151,6 +153,7 @@ func (s *Store) Search(q string, qvec []float32, embedder string, modalities []s
 			scores[b.id] += 1.0 / float64(rrfK+i+1)
 			via[b.id] = append(via[b.id], "vector")
 			match[b.id] = b.piece
+			sims[b.id] = b.sim
 		}
 	}
 
@@ -170,7 +173,7 @@ func (s *Store) Search(q string, qvec []float32, embedder string, modalities []s
 		if err != nil {
 			return nil, err
 		}
-		h := Hit{Entry: e, Score: scores[id], Via: via[id], Snippet: snippets[id]}
+		h := Hit{Entry: e, Score: scores[id], Sim: sims[id], Via: via[id], Snippet: snippets[id]}
 		// Name the attachment that matched, so the reader can open it.
 		if m := match[id]; strings.Contains(m, ":") {
 			hash := m[strings.IndexByte(m, ':')+1:]

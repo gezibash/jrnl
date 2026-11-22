@@ -1396,3 +1396,23 @@ func TestShowIsFrontMatterThenBody(t *testing.T) {
 		}
 	}
 }
+
+// --fast skips the reranker and keeps only hits whose meaning score reaches
+// --min-score. In the fake, a sign-in query sits 0.5 from a sign-in entry
+// (a document puts half its weight on its concept) and 0 from anything else.
+func TestFastSearchSkipsRerankAndCutsByScore(t *testing.T) {
+	e := newEnv(t)
+	auth := firstID(e.must("Users could not sign in after the token refresh.", "add", "--kind", "bug"))
+	auth2 := firstID(e.must("Login page rejected valid credentials on Safari.", "add", "--kind", "bug"))
+	e.must("Chose Go over Bun for the CLI.", "add", "--kind", "decision")
+
+	// Two hits survive the cut, so a reranker would be asked.
+	chats := len(e.ai.chatReqs)
+	sameSet(t, "--fast --min-score 0.4", ids(e.must("", "search", "--fast", "--min-score", "0.4", "login failure")), auth, auth2)
+	if got := ids(e.must("", "search", "--fast", "--min-score", "0.6", "login failure")); len(got) != 0 {
+		t.Errorf("0.5 is under 0.6, so nothing should be left, got %v", got)
+	}
+	if len(e.ai.chatReqs) != chats {
+		t.Errorf("--fast should not call the chat model to rerank")
+	}
+}

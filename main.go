@@ -35,6 +35,8 @@ const usage = `jrnl — per-project journal
   jrnl list [filters]          newest first; --oldest for oldest first
   jrnl search [filters] QUERY  keyword + semantic search over entries and attachment descriptions
       --newest | --oldest      the latest / the first matches, instead of the best
+      --fast                   no reranker (about 0.2 s, not 0.6 s); implies --min-score 0.65
+      --min-score S            drop hits whose meaning score (cosine) is under S
   jrnl search --like FILE      find attachments whose description is like FILE's
   jrnl sessions [filters]      recent sessions: last active, how many entries, last title
   jrnl stats [filters]         counts by kind, tag and author
@@ -480,9 +482,19 @@ func cmdSearch(args []string) error {
 	like := fs.String("like", "", "")
 	newest := fs.Bool("newest", false, "")
 	oldest := fs.Bool("oldest", false, "")
+	fast := fs.Bool("fast", false, "")
+	minScore := fs.Float64("min-score", -1, "")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
+	}
+	if *minScore < 0 {
+		*minScore = 0
+		if *fast {
+			// EmbeddingGemma 2 on a 100-entry journal: questions about real
+			// entries scored 0.72-0.85, unrelated ones 0.56-0.60.
+			*minScore = 0.65
+		}
 	}
 	q := strings.TrimSpace(strings.Join(pos, " "))
 	if q == "" && *like == "" {
@@ -554,7 +566,10 @@ func cmdSearch(args []string) error {
 	if len(hits) == 0 && aiErr != nil && awaitingSetup(s, aiErr) {
 		fmt.Fprintln(os.Stderr, "jrnl: no keyword match; search by meaning is off (see `jrnl doctor`)")
 	}
-	if qvec != nil && q != "" && len(hits) > 1 {
+	if qvec != nil && *minScore > 0 {
+		hits = slices.DeleteFunc(hits, func(h Hit) bool { return float64(h.Sim) < *minScore })
+	}
+	if qvec != nil && q != "" && len(hits) > 1 && !*fast {
 		k := min(*limit, 20)
 		if order != "" {
 			k = 0 // every relevant entry; sorted by date below
