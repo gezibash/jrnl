@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -19,7 +18,6 @@ import (
 
 	"github.com/knights-analytics/hugot"
 	"github.com/knights-analytics/hugot/backends"
-	"github.com/knights-analytics/hugot/options"
 	"github.com/knights-analytics/hugot/pipelines"
 )
 
@@ -97,16 +95,6 @@ func localDownloaded() bool {
 	return true
 }
 
-// localGPU: run the model on the GPU where there is one (jrnl serve). The GPU
-// compiles a program per input shape, about 0.4 s each, so inputs are padded
-// to a few lengths and batch sizes, and the server compiles them all before
-// it answers; a one-shot command stays on the CPU, which needs none.
-var (
-	localGPU         bool
-	localSeqBuckets  = []int{16, 32, 64, 128, 256, 512}
-	localBatchBucket = []int{1, 4}
-)
-
 type localEmbedder struct {
 	mu  sync.Mutex // guards p and err
 	run sync.Mutex // one model call at a time: a search and a backfill share it
@@ -133,11 +121,7 @@ func (l *localEmbedder) load(download bool) (*pipelines.FeatureExtractionPipelin
 			return nil, err
 		}
 	}
-	var opts []options.WithOption
-	if localGPU && useGPU() {
-		opts = append(opts, options.WithGoMLXSequenceBuckets(localSeqBuckets), options.WithGoMLXBatchBuckets(localBatchBucket))
-	}
-	s, err := hugot.NewGoSession(context.Background(), opts...)
+	s, err := hugot.NewGoSession(context.Background())
 	if err == nil {
 		l.p, err = hugot.NewPipeline(s, hugot.FeatureExtractionConfig{ModelPath: localDir(), Name: localModel,
 			OnnxFilename: "model.onnx"})
@@ -274,21 +258,4 @@ func fitTokens(p *pipelines.FeatureExtractionPipeline, texts []string) []string 
 		return texts
 	}
 	return out
-}
-
-// warm compiles the model for every padded shape, so no search waits for it.
-func (l *localEmbedder) warm() error {
-	for _, n := range localSeqBuckets {
-		text := strings.TrimSpace(strings.Repeat("word ", n-2)) // n tokens with the markers
-		for _, b := range localBatchBucket {
-			batch := make([]string, b)
-			for i := range batch {
-				batch[i] = text
-			}
-			if _, err := l.embed(batch, false); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
