@@ -4,6 +4,8 @@ go 1.27.1
 
 require (
 	github.com/BurntSushi/toml v1.6.0
+	github.com/gomlx/compute v0.1.28
+	github.com/gomlx/go-darwinml v0.1.5
 	github.com/knights-analytics/hugot v0.8.6
 	modernc.org/sqlite v1.62.0
 )
@@ -13,7 +15,6 @@ require (
 	github.com/eliben/go-sentencepiece v0.7.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/gofrs/flock v0.13.2 // indirect
-	github.com/gomlx/compute v0.1.28 // indirect
 	github.com/gomlx/compute-onnx v0.1.28 // indirect
 	github.com/gomlx/exceptions v0.0.3 // indirect
 	github.com/gomlx/go-huggingface v0.4.32 // indirect

@@ -103,7 +103,11 @@ func cmdServe(args []string) error {
 	}
 	ai.download = true
 	if ai.local {
+		localGPU = true
 		if _, err := local.load(true); err != nil {
+			return fmt.Errorf("serve: %w", err)
+		}
+		if err := local.warm(); err != nil {
 			return fmt.Errorf("serve: %w", err)
 		}
 	}
