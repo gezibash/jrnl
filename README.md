@@ -31,13 +31,15 @@ Install from the tap as shown above. Both install a `jrnl` command, so keep one.
 ## Setup
 
 None. Install the binary and start writing: entries, filters, dates,
-open/closed tracking and keyword search all work with nothing else.
+open/closed tracking, keyword search and search by meaning all work with
+nothing else. The embedding model, BAAI/bge-small-en-v1.5, runs inside jrnl;
+`jrnl reindex` (or the first `jrnl serve`) downloads it once, 128 MB.
 
 Each optional part adds more. Turn them on in any order, whenever you like:
 
 | Adds | Needs |
 |---|---|
-| Search by meaning | An embedding model. Default: [Ollama](https://ollama.com) on this machine with `ollama pull embeddinggemma-2:270m` |
+| Search by meaning with another model | Any OpenAI-compatible embeddings API in `[embed]`, such as [Ollama](https://ollama.com) with `embeddinggemma-2:270m`. Without it, the built-in bge-small-en-v1.5 |
 | Reranking, captions, summaries | A chat model that takes images |
 | Faster reranking | A reranker with a Cohere-style `/rerank` API (Cohere, Voyage, Jina, or any of them through Vercel AI Gateway) |
 | `search --like` by look and sound | Media embeddings from Cloudflare Workers AI. Without them, `--like` compares descriptions, which needs the chat model |
@@ -115,7 +117,7 @@ use up its reply budget and return nothing.
 
 Measured on 20,000 entries spread over 3 months, with 30 test questions:
 
-| | No setup | With Ollama and Workers AI |
+| | Keywords only | With Ollama and Workers AI |
 |---|---|---|
 | Question with the entry's own words: right entry first | 30 of 30 | 30 of 30 |
 | Question in other words: right entry first | 8 of 30 | 21 of 30 |
@@ -125,11 +127,19 @@ Measured on 20,000 entries spread over 3 months, with 30 test questions:
 The reworded questions avoid the entry's words on purpose, so they are the
 hard case. Search by meaning is what closes that gap.
 
+The built-in model was measured on a real 113-entry journal instead, with 27
+reworded questions and 18 unrelated ones: by its vectors alone it puts the
+right entry first for 24 of 27, as EmbeddingGemma through Ollama does (potion-base-32M:
+18), and through `jrnl serve` it shows the answer for 25 of 27 while 2 of the
+18 unrelated questions get a hit.
+
 ## Search from a coding-agent hook
 
-`jrnl serve --background` keeps a small embedding model (potion-base-32M,
-downloaded once, 131 MB) and every journal's index in memory, and answers
-over a Unix socket at `~/.journal/.run/jrnl.sock`:
+`jrnl serve --background` keeps the embedding model and every journal's
+index in memory (about 500 MB with the built-in model), and answers over a
+Unix socket at `~/.journal/.run/jrnl.sock`. Other jrnl commands embed through
+it, so they stay small; one that finds no server loads the model itself and
+starts one.
 
 ```bash
 curl --unix-socket ~/.journal/.run/jrnl.sock 'http://jrnl/search?project=<name>&q=<words>&limit=5'
@@ -139,7 +149,7 @@ Add `format=context` for a block written for a coding agent to read: each
 entry's whole title and its text (the passage that matches, when long), how it
 matched, when and at which commit it was written, and later entries that link
 to it, such as a newer decision; `exclude=ID,ID` leaves out entries the agent
-already has. A search takes about a millisecond on 20,000 entries, so a hook
+already has. A search takes about 9 ms on 20,000 entries (almost all of it embedding the question), so a hook
 can run one on every prompt. It shows only clear matches, and nothing for an unrelated
 question. The server runs one at a time, replaces a server of another version
 when started, frees a journal after 10 idle minutes and exits after 30.

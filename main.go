@@ -65,11 +65,11 @@ WHEN, in local time: today, yesterday, 3 days ago, monday, last monday,
 --session last: the most recent session before this one.
 every command: --project P (default: from git remote, else directory name)
 
-jrnl works with no setup: entries, filters and keyword search. Optional parts,
+jrnl works with no setup: entries, filters, keyword and meaning search. Optional parts,
 each a role in ~/.config/jrnl/config.toml (or JRNL_CONFIG) that names a provider
 and a model; see the README:
   [embed]             search by meaning, any OpenAI-compatible API
-                      (default: Ollama on this machine, embeddinggemma-2:270m)
+                      (default: bge-small-en-v1.5 inside jrnl, downloaded once)
   [chat]              reranking, summaries, captions (a model that reads images)
   [rerank]            faster reranking: a Cohere-style /rerank API
   [media_embed]       search --like by look and sound (Cloudflare Workers AI);
