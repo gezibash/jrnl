@@ -14,6 +14,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -224,6 +225,7 @@ func (s *Store) Delete(id string) error {
 		`DELETE FROM chunks WHERE entry_id = ?`, `DELETE FROM entries_fts WHERE entry_id = ?`,
 		`DELETE FROM tags WHERE entry_id = ?`, `DELETE FROM links WHERE src = ? OR dst = ?`,
 		`DELETE FROM files WHERE entry_id = ?`, `DELETE FROM entry_assets WHERE entry_id = ?`,
+		`UPDATE entries SET closed_by = '' WHERE closed_by = ?`,
 		`DELETE FROM entries WHERE id = ?`,
 	} {
 		args := []any{id}
@@ -235,6 +237,56 @@ func (s *Store) Delete(id string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// Remove deletes entries for good (jrnl rm): the entries, the saved
+// summaries that cite them (and the summaries citing those), which it
+// counts, and the attachment files no other entry uses. Then it rewrites
+// the database, so the text is gone from the file and not only unlisted:
+// the keyword index keeps deleted words until its segments merge, freed
+// pages keep their bytes until a vacuum, and the write-ahead log keeps old
+// pages until it is truncated.
+func (s *Store) Remove(ids []string) (summaries int, err error) {
+	for i := 0; i < len(ids); i++ {
+		citing := s.strings(`SELECT id FROM entries WHERE kind = 'summary' AND instr(body, ?) > 0`, ids[i][:shortIDLen])
+		for _, c := range citing {
+			if !slices.Contains(ids, c) {
+				ids = append(ids, c)
+				summaries++
+			}
+		}
+		if err := s.Delete(ids[i]); err != nil {
+			return summaries, err
+		}
+	}
+	rows, err := s.db.Query(`DELETE FROM assets WHERE hash NOT IN (SELECT hash FROM entry_assets) RETURNING hash, ext`)
+	if err != nil {
+		return summaries, err
+	}
+	var files []string
+	for rows.Next() {
+		var hash, ext string
+		if err := rows.Scan(&hash, &ext); err != nil {
+			rows.Close()
+			return summaries, err
+		}
+		files = append(files, s.assetPath(hash, ext))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return summaries, err
+	}
+	for _, f := range files {
+		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return summaries, err
+		}
+	}
+	for _, q := range []string{`INSERT INTO entries_fts(entries_fts) VALUES('optimize')`, `VACUUM`, `PRAGMA wal_checkpoint(TRUNCATE)`} {
+		if _, err := s.db.Exec(q); err != nil {
+			return summaries, fmt.Errorf("removed, but the database was not rewritten (%s): %w", q, err)
+		}
+	}
+	return summaries, nil
 }
 
 // SetStatus opens, closes or reopens entries. closedBy is the entry holding

@@ -59,7 +59,7 @@ func cmdServe(args []string) error {
 		// A server of another version (an upgrade, or a switch between
 		// installs) is asked to quit, and its lock awaited, so the new
 		// binary serves.
-		if running, ok := runningVersion(sock); ok {
+		if running, _, ok := runningServer(sock); ok {
 			if running == version {
 				fmt.Println("jrnl serve: already running at", sock)
 				return nil
@@ -120,6 +120,10 @@ func cmdServe(args []string) error {
 		return err
 	}
 	sv := newServer(ai)
+	sv.reconfigured = func() bool {
+		now, err := NewAI()
+		return err == nil && now.embedID != ai.embedID
+	}
 	srv := &http.Server{Handler: sv}
 	go func() {
 		<-sv.quit
@@ -138,19 +142,17 @@ func socketClient(sock string) *http.Client {
 		}}}
 }
 
-// runningVersion is the version of the server answering at sock, if any.
-func runningVersion(sock string) (string, bool) {
+// runningServer is the version and the embedder of the server answering
+// at sock, if any.
+func runningServer(sock string) (version, embedder string, ok bool) {
 	r, err := socketClient(sock).Get("http://jrnl/health")
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	defer r.Body.Close()
 	b, _ := io.ReadAll(r.Body)
-	f := strings.Fields(string(b)) // "jrnl <version> <model>"
-	if len(f) < 2 {
-		return "", true
-	}
-	return f[1], true
+	f := append(strings.Fields(string(b)), "", "") // "jrnl <version> <embedder>"
+	return f[1], f[2], true
 }
 
 // quitServer stops the server at sock and waits until it has released
@@ -181,6 +183,11 @@ type server struct {
 	quit     chan struct{}
 	quitOnce sync.Once
 	mux      *http.ServeMux
+	// reconfigured says the settings now name another embedder than the one
+	// this server started with. Each chunk holds one vector, so embedding
+	// with the old one would undo a reindex done with the new one, on every
+	// search: the server quits instead, and the next one starts right.
+	reconfigured func() bool
 }
 
 // served is one project's journal and its in-memory index, rebuilt when
@@ -199,7 +206,7 @@ func newServer(ai *AI) *server {
 	sv := &server{ai: ai, projects: map[string]*served{}, last: time.Now(), quit: make(chan struct{})}
 	sv.mux = http.NewServeMux()
 	sv.mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "jrnl %s %s\n", version, ai.embedModel)
+		fmt.Fprintf(w, "jrnl %s %s\n", version, ai.embedID)
 	})
 	sv.mux.HandleFunc("POST /quit", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "bye")
@@ -377,7 +384,13 @@ func (sv *server) project(name string) (*served, error) {
 func (sv *server) backfill(p *served) {
 	time.Sleep(backfillDelay)
 	stored := 0
-	ps, err := p.s.Pending("", sv.ai.embedID, "")
+	var ps []pending
+	var err error
+	if sv.reconfigured != nil && sv.reconfigured() {
+		sv.stop()
+	} else {
+		ps, err = p.s.Pending("", sv.ai.embedID, "")
+	}
 	defer func() {
 		sv.mu.Lock()
 		p.backfilling = false

@@ -4,6 +4,7 @@ package main
 // boundary Claude uses.
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -2176,4 +2177,181 @@ func TestLocalResetDuringEmbedding(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// Only jrnl add starts a journal. A command that reads said nothing and left
+// an empty journal behind for every folder it was run in; doctor still works
+// before the first entry, since it is how setup is checked.
+func TestReadingStartsNoJournal(t *testing.T) {
+	e := newEnv(t)
+	for _, args := range [][]string{{"list"}, {"search", "anything"}, {"stats"}, {"show", "01M"}, {"reindex"}} {
+		if _, errOut, err := e.run("", args...); err == nil || !strings.Contains(errOut, "no journal for test yet") {
+			t.Errorf("jrnl %v: want an error saying there is no journal yet, got %v %q", args, err, errOut)
+		}
+	}
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "0 entries") {
+		t.Errorf("doctor should work before the first entry:\n%s", doc)
+	}
+	if _, err := os.Stat(filepath.Join(e.home, "test")); err == nil {
+		t.Error("reading created a journal")
+	}
+	id := firstID(e.must("First entry.", "add"))
+	if out := e.must("", "list"); !strings.HasPrefix(out, id) {
+		t.Errorf("list after the first add:\n%s", out)
+	}
+}
+
+// A mistyped kind or an empty tag is refused, not saved as a new kind or
+// tag that every later filter and count then carries.
+func TestAddRefusesUnknownKindAndBadTag(t *testing.T) {
+	e := newEnv(t)
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"add", "--kind", "decison", "text"}, `not "decison"`},
+		{[]string{"add", "--kind", "summary", "text"}, `not "summary"`},
+		{[]string{"add", "--tag", "", "text"}, "--tag is one word"},
+		{[]string{"add", "--tag", "two words", "text"}, "--tag is one word"},
+	} {
+		if out, errOut, err := e.run("", c.args...); err == nil || !strings.Contains(errOut, c.want) || out != "" {
+			t.Errorf("jrnl %v: want an error with %q and no ID, got %v %q %q", c.args, c.want, err, errOut, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(e.home, "test")); err == nil {
+		t.Error("a refused add started a journal")
+	}
+	e.must("text", "add", "--kind", "milestone", "--tag", "release")
+}
+
+// A config.toml that jrnl refuses is an error from summarize too; it
+// crashed with a nil pointer instead.
+func TestSummarizeWithBadConfig(t *testing.T) {
+	e := newEnv(t)
+	e.must("Shipped the importer.", "add")
+	e.config, e.noChat = "[chat]\nmodel = \"m\"\n", true // the config's chat, not the test default
+	_, errOut, err := e.run("", "summarize", "--on", "today")
+	if err == nil || !strings.Contains(errOut, "config [chat] needs a provider") || strings.Contains(errOut, "panic") {
+		t.Errorf("want the config error, got %v %q", err, errOut)
+	}
+}
+
+// jrnl rm is the way out after a secret was written down, so what it
+// removes must be gone from the files, not only from the listings: the
+// entry's text, an attachment no other entry uses, and a saved summary
+// that cites it. An attachment another entry still uses stays.
+func TestRmErases(t *testing.T) {
+	e := newEnv(t)
+	const secret, fileSecret = "Zqxmarker9173", "Wkvattach5520"
+	note := filepath.Join(t.TempDir(), "notes.txt")
+	os.WriteFile(note, []byte("token "+fileSecret), 0o644)
+	bad := firstID(e.must("Deploy key rotated.\n\nThe key is "+secret+" for now.", "add", "--tag", secret, "--attach", note, "--at", "yesterday"))
+	keeps := firstID(e.must("Same notes file, kept.", "add", "--attach", note, "--at", "yesterday"))
+	todo := firstID(e.must("Rotate the key.", "add", "--kind", "todo"))
+	e.must("", "close", todo, "--note", "done, see "+secret)
+	closeNote := firstID(e.must("", "list", "--kind", "log"))
+	e.must("", "summarize", "--on", "yesterday")
+	if out := e.must("", "list", "--kind", "summary"); out == "" {
+		t.Fatal("no summary was saved")
+	}
+
+	dir := filepath.Join(e.home, "test")
+	holds := func(marker string) (where []string) {
+		filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				b, _ := os.ReadFile(p)
+				if bytes.Contains(bytes.ToLower(b), []byte(strings.ToLower(marker))) {
+					where = append(where, filepath.Base(p))
+				}
+			}
+			return nil
+		})
+		return where
+	}
+	if len(holds(secret)) == 0 || len(holds(fileSecret)) == 0 {
+		t.Fatal("the markers are not in the journal's files before rm; the check below would prove nothing")
+	}
+
+	out, errOut, err := e.run("", "rm", bad, closeNote)
+	if err != nil || !strings.Contains(out, bad+"  removed") || !strings.Contains(errOut, "1 saved summary") {
+		t.Fatalf("rm: %v\n%s\n%s", err, out, errOut)
+	}
+	if where := holds(secret); len(where) > 0 {
+		t.Errorf("the removed text is still in %v", where)
+	}
+	if where := holds(fileSecret); len(where) != 1 {
+		t.Errorf("the attachment another entry uses should be the only copy left, found %v", where)
+	}
+	if out := e.must("", "list", "--limit", "100"); strings.Contains(out, bad) || strings.Contains(out, "summary") || !strings.Contains(out, keeps) {
+		t.Errorf("list after rm:\n%s", out)
+	}
+	if out := e.must("", "show", todo); strings.Contains(out, "closed_by") || !strings.Contains(out, "status: closed") {
+		t.Errorf("the todo should stay closed without its removed note:\n%s", out)
+	}
+	e.must("", "rm", keeps)
+	if where := holds(fileSecret); len(where) > 0 {
+		t.Errorf("the attachment no entry uses is still in %v", where)
+	}
+}
+
+// A server started under one embedder must not undo a reindex done after
+// config.toml named another: each chunk holds one vector, and the server
+// embedded every entry again its own way on the next search. It quits
+// instead, and the vectors stay.
+func TestServeQuitsWhenTheEmbedderChanges(t *testing.T) {
+	e := newEnv(t)
+	home, err := os.MkdirTemp("/tmp", "jrs") // a socket path is limited to 104 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	e.home, e.dir = home, filepath.Join(t.TempDir(), "test")
+	os.MkdirAll(e.dir, 0o755)
+	quitServerAt(t, home)
+	conf := func(model string) string {
+		return "[providers.o]\nurl = \"" + e.url + "/v1\"\n[embed]\nprovider = \"o\"\nmodel = \"" + model + "\"\n"
+	}
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL="} // the config's embedder, not the test default
+	e.config = conf("emb-a")
+	e.must("Login form rejects valid credentials.", "add")
+	e.must("Chose Go over Bun for the CLI.", "add")
+	e.must("", "serve", "--background")
+	sock := filepath.Join(home, ".run", "jrnl.sock")
+	up := func() bool {
+		_, _, ok := runningServer(sock)
+		return ok
+	}
+	for i := 0; !up(); i++ {
+		if i == 100 {
+			t.Fatal("the server did not start")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	e.config = conf("emb-b")
+	e.must("", "reindex")
+	embedders := func() string {
+		out, err := exec.Command("sqlite3", filepath.Join(home, "test", "journal.db"),
+			"select group_concat(distinct embedder) from chunks").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	want := embedders()
+	if !strings.HasPrefix(want, "emb-b@") {
+		t.Fatalf("reindex should have embedded with the new model, got %q", want)
+	}
+	if r, err := socketClient(sock).Get("http://jrnl/search?project=test&q=login+credentials"); err == nil {
+		r.Body.Close()
+	}
+	for i := 0; up(); i++ {
+		if i == 120 {
+			t.Fatal("the server is still running 6 s after a search under changed settings")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := embedders(); got != want {
+		t.Errorf("the server embedded again with its old model: %q, want %q", got, want)
+	}
 }
