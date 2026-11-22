@@ -17,9 +17,16 @@ this error before", "what's still open", "summarise last week".
 
 ```bash
 mise use -g github:gezibash/jrnl
+# or
+brew install gezibash/tap/jrnl
+# or, into ~/.local/bin (JRNL_INSTALL_DIR picks another folder)
+curl -fsSL https://raw.githubusercontent.com/gezibash/jrnl/main/install.sh | sh
 ```
 
 Or download a binary from the releases page, or `go install github.com/gezibash/jrnl@main`.
+
+Homebrew's own `jrnl` formula is a different program, a Python note taker.
+Install from the tap as shown above. Both install a `jrnl` command, so keep one.
 
 ## Setup
 
@@ -117,6 +124,22 @@ Measured on 20,000 entries spread over 3 months, with 30 test questions:
 
 The reworded questions avoid the entry's words on purpose, so they are the
 hard case. Search by meaning is what closes that gap.
+
+## Search from a coding-agent hook
+
+`jrnl serve --background` keeps a small embedding model (potion-base-32M,
+downloaded once, 131 MB) and every journal's index in memory, and answers
+over a Unix socket at `~/.journal/.run/jrnl.sock`:
+
+```bash
+curl --unix-socket ~/.journal/.run/jrnl.sock 'http://jrnl/search?project=<name>&q=<words>&limit=5'
+```
+
+A search takes about a millisecond on 20,000 entries, so a hook can run one on
+every prompt. It shows only clear matches, and nothing for an unrelated
+question. The server runs one at a time, replaces a server of another version
+when started, frees a journal after 10 idle minutes and exits after 30.
+`jrnl search --fast` gives the same kind of answer from the command line.
 
 ## Use
 
