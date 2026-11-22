@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -418,6 +419,13 @@ func (sv *server) backfill(p *served) {
 		sv.mu.Lock()
 		p.retryAt = time.Now().Add(time.Minute)
 		sv.mu.Unlock()
+	}
+	if stored > 0 && sv.ai.local {
+		// A backfill leaves the model's buffer pool at its largest (1.15 GB
+		// resident after re-embedding 197 chunks, against about 500 MB);
+		// a server that idles for half an hour should give it back.
+		local.reset()
+		debug.FreeOSMemory()
 	}
 }
 

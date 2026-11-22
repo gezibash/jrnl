@@ -96,8 +96,9 @@ func localDownloaded() bool {
 }
 
 type localEmbedder struct {
-	mu  sync.Mutex // guards p and err
+	mu  sync.Mutex // guards s, p and err
 	run sync.Mutex // one model call at a time: a search and a backfill share it
+	s   *hugot.Session
 	p   *pipelines.FeatureExtractionPipeline
 	err error
 }
@@ -123,6 +124,7 @@ func (l *localEmbedder) load(download bool) (*pipelines.FeatureExtractionPipelin
 	}
 	s, err := hugot.NewGoSession(context.Background())
 	if err == nil {
+		l.s = s
 		l.p, err = hugot.NewPipeline(s, hugot.FeatureExtractionConfig{ModelPath: localDir(), Name: localModel,
 			OnnxFilename: "model.onnx"})
 	}
@@ -136,19 +138,20 @@ func (l *localEmbedder) load(download bool) (*pipelines.FeatureExtractionPipelin
 
 // embed returns a unit vector for each text, already formatted.
 func (l *localEmbedder) embed(texts []string, download bool) ([][]float32, error) {
-	p, err := l.load(download)
-	if err != nil {
-		return nil, err
-	}
-	texts = fitTokens(p, texts)
 	// Groups of 4 keep a search behind a backfill waiting tens of
-	// milliseconds, not hundreds.
+	// milliseconds, not hundreds. Each group takes the model under the run
+	// lock, so a reset between groups cannot pull it away mid-call.
 	out := make([][]float32, 0, len(texts))
 	for i := 0; i < len(texts); i += 4 {
 		l.run.Lock()
+		p, err := l.load(download)
+		if err != nil {
+			l.run.Unlock()
+			return nil, err
+		}
 		// The model is trained for its first token's state ([CLS]), not the
 		// mean: on the tycoon set, right entry first for 24 of 27 against 23.
-		r, err := p.RunRaw(context.Background(), texts[i:min(i+4, len(texts))])
+		r, err := p.RunRaw(context.Background(), fitTokens(p, texts[i:min(i+4, len(texts))]))
 		l.run.Unlock()
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", localModel, err)
@@ -158,6 +161,21 @@ func (l *localEmbedder) embed(texts []string, download bool) ([][]float32, error
 		}
 	}
 	return out, nil
+}
+
+// reset closes the model, so the next call loads it again (about 80 ms).
+// GoMLX's CPU backend keeps a pool of buffers sized by the longest input it
+// has run, which nothing else empties: about 300 MB after re-embedding a
+// journal, held for as long as the server lives.
+func (l *localEmbedder) reset() {
+	l.run.Lock()
+	defer l.run.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.s != nil {
+		l.s.Destroy()
+	}
+	l.s, l.p, l.err = nil, nil, nil
 }
 
 // fetchModel downloads the model files into dir. A lock keeps two processes

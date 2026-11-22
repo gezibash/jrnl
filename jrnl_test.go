@@ -2138,3 +2138,42 @@ func quitServerAt(t *testing.T, home string) {
 		t.Errorf("a jrnl serve under %s did not quit", home)
 	})
 }
+
+// The server closes the model after a backfill to free its buffers; a
+// search embedding at that moment still gets its vectors.
+func TestLocalResetDuringEmbedding(t *testing.T) {
+	needLocalModel(t)
+	texts := []string{"Users could not sign in after the token refresh.", "Chose Go over Bun for the CLI.",
+		"Refunds failed when the card network timed out.", "The tutorial card stayed after the last step.", "Rival studios poach developers."}
+	want, err := local.embed(texts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				local.reset()
+			}
+		}
+	}()
+	for range 5 {
+		got, err := local.embed(texts, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range texts {
+			if c := dot(got[i], want[i]); c < 0.9999 {
+				t.Errorf("text %d: vector changed across a reset, cosine %.5f", i, c)
+			}
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
