@@ -157,3 +157,16 @@ jrnl list --status open --on "last week"
 jrnl summarize --on "last week"
 jrnl help
 ```
+
+A newer decision can say which one it replaces, so the decisions on a topic read
+as a thread whose newest entry is the current state:
+
+```bash
+jrnl add --kind decision --supersedes 01M7WEN3 "Cloudflare kept as a provider type"
+jrnl link NEW OLD --supersedes   # afterwards; --rm removes a wrong link
+```
+
+`show` and the agent recall block then mark the older entry as superseded and
+keep its text, since it often holds the reason. With `jrnl serve` running,
+`jrnl add --kind decision` lists similar earlier decisions and the command to
+link one; it never links by itself.
