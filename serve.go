@@ -5,12 +5,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -41,12 +43,28 @@ func cmdServe(args []string) error {
 		return err
 	}
 	sock := socketPath()
-	if c, err := net.DialTimeout("unix", sock, 200*time.Millisecond); err == nil {
-		c.Close()
-		fmt.Println("jrnl serve: already running at", sock)
-		return nil
+	dir := filepath.Dir(sock)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
 	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+	lockPath := filepath.Join(dir, "jrnl.lock")
+
 	if *background {
+		// A server of another version (an upgrade, or a switch between
+		// installs) is asked to quit, and its lock awaited, so the new
+		// binary serves.
+		if running, ok := runningVersion(sock); ok {
+			if running == version {
+				fmt.Println("jrnl serve: already running at", sock)
+				return nil
+			}
+			if err := quitServer(sock, lockPath); err != nil {
+				return err
+			}
+		}
 		exe, err := os.Executable()
 		if err != nil {
 			return err
@@ -60,19 +78,28 @@ func cmdServe(args []string) error {
 		return cmd.Process.Release()
 	}
 
-	dir := filepath.Dir(sock)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	// One server per journal home: the lock's holder alone loads the model
+	// and owns the socket, held until the process exits. Without it, two
+	// servers started together both ran, one of them unreachable.
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
 		return err
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			fmt.Println("jrnl serve: already running at", sock)
+			return nil
+		}
 		return err
 	}
+
 	// Downloads the model on first use (131 MB, once per machine).
 	enc, err := potion.New(context.Background(), serveModel)
 	if err != nil {
 		return fmt.Errorf("serve: load %s: %w", serveModel, err)
 	}
-	os.Remove(sock)
+	os.Remove(sock) // left by a server that was killed
 	l, err := net.Listen("unix", sock)
 	if err != nil {
 		return err
@@ -91,6 +118,48 @@ func cmdServe(args []string) error {
 		return err
 	}
 	return nil
+}
+
+func socketClient(sock string) *http.Client {
+	return &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		}}}
+}
+
+// runningVersion is the version of the server answering at sock, if any.
+func runningVersion(sock string) (string, bool) {
+	r, err := socketClient(sock).Get("http://jrnl/health")
+	if err != nil {
+		return "", false
+	}
+	defer r.Body.Close()
+	b, _ := io.ReadAll(r.Body)
+	f := strings.Fields(string(b)) // "jrnl <version> <model>"
+	if len(f) < 2 {
+		return "", true
+	}
+	return f[1], true
+}
+
+// quitServer stops the server at sock and waits until it has released
+// the lock, so the next one can take it.
+func quitServer(sock, lockPath string) error {
+	if r, err := socketClient(sock).Post("http://jrnl/quit", "", nil); err == nil {
+		r.Body.Close()
+	}
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	for range 50 {
+		if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+			return syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return errors.New("serve: the running server did not quit within 5 s")
 }
 
 type server struct {

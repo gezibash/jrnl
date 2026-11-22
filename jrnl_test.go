@@ -1646,3 +1646,87 @@ func TestServeUnloadsIdleJournals(t *testing.T) {
 		t.Errorf("want the entry written while unloaded first, got %v", hits)
 	}
 }
+
+// One server per journal home. Two started together left both running,
+// one unreachable and holding the model until it idled out; and a server
+// of an older version kept answering after an upgrade.
+func TestServeOneServerOfTheCurrentVersion(t *testing.T) {
+	cache, _ := os.UserCacheDir()
+	if _, err := os.Stat(filepath.Join(cache, "go-potion", "BASE32M", "model.safetensors")); err != nil {
+		t.Skip("potion BASE32M not cached")
+	}
+	home, err := os.MkdirTemp("/tmp", "jrs") // a socket path is limited to 104 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	sock := filepath.Join(home, ".run", "jrnl.sock")
+	env := append(os.Environ(), "JRNL_HOME="+home)
+	health := func() string {
+		r, err := socketClient(sock).Get("http://jrnl/health")
+		if err != nil {
+			return ""
+		}
+		defer r.Body.Close()
+		b, _ := io.ReadAll(r.Body)
+		return strings.TrimSpace(string(b))
+	}
+	waitFor := func(want string) {
+		t.Helper()
+		for range 100 {
+			if strings.HasPrefix(health(), want) {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("health never became %q (last %q)", want, health())
+	}
+
+	var procs []*exec.Cmd
+	for range 2 {
+		c := exec.Command(bin, "serve")
+		c.Env = env
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		procs = append(procs, c)
+	}
+	t.Cleanup(func() {
+		for _, c := range procs {
+			c.Process.Kill()
+		}
+	})
+	waitFor("jrnl dev ")
+	exited := make(chan int, 2)
+	for i, c := range procs {
+		go func() { c.Wait(); exited <- i }()
+	}
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("two servers started together are both still running")
+	}
+	select {
+	case i := <-exited:
+		t.Fatalf("both servers exited (second: %d); none is serving", i)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// An upgrade: the new binary's serve --background replaces the old server.
+	newer := filepath.Join(t.TempDir(), "jrnl")
+	if out, err := exec.Command("go", "build", "-ldflags", "-X main.version=9.9.9", "-o", newer, ".").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	up := exec.Command(newer, "serve", "--background")
+	up.Env = env
+	if out, err := up.CombinedOutput(); err != nil {
+		t.Fatalf("serve --background: %v\n%s", err, out)
+	}
+	waitFor("jrnl 9.9.9 ")
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Error("the older server is still running after the upgrade")
+	}
+	t.Cleanup(func() { socketClient(sock).Post("http://jrnl/quit", "", nil) })
+}

@@ -1049,6 +1049,16 @@ func cmdDoctor(args []string) error {
 		}
 	}
 	row("parakeet", parakeetOn, "transcripts of audio and video", how)
+	cache, _ := os.UserCacheDir()
+	_, modelErr := os.Stat(filepath.Join(cache, "go-potion", string(serveModel), "model.safetensors"))
+	how = "run `jrnl serve --background`; the first start downloads a 131 MB model, once per machine"
+	if modelErr == nil {
+		how = "model " + string(serveModel) + " downloaded; server not running"
+		if v, ok := runningVersion(socketPath()); ok {
+			how = "model " + string(serveModel) + "; server " + v + " running at " + socketPath()
+		}
+	}
+	row("serve", modelErr == nil, "searches in about a millisecond, for coding-agent hooks", how)
 	if waiting > 0 {
 		fmt.Println("\nAfter turning a part on, run `jrnl reindex` to index what was saved before.")
 	}
