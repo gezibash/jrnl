@@ -1,0 +1,5 @@
+{
+  "name": "jrnl",
+  "owner": { "name": "gezibash" },
+  "plugins": [{ "name": "jrnl-recall", "source": "./mods/jrnl-recall" }]
+}
