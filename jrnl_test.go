@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/knights-analytics/hugot/backends"
 	"io"
 	"net"
 	"net/http"
@@ -1998,5 +1999,98 @@ func TestServeBackfill(t *testing.T) {
 	s.db.QueryRow(`SELECT count(*) FROM chunks WHERE embedder = ? AND vec IS NOT NULL`, localID).Scan(&n)
 	if n != 2 {
 		t.Errorf("want both entries' vectors stored by the server's embedder, got %d", n)
+	}
+}
+
+// A model file that does not load leaves entries waiting for reindex, not
+// marked as text that can never be embedded; with the model fixed, reindex
+// embeds them.
+func TestBrokenModelWaits(t *testing.T) {
+	needLocalModel(t)
+	e := newEnv(t)
+	broken := t.TempDir()
+	os.WriteFile(filepath.Join(broken, "model.onnx"), []byte("junk"), 0o644)
+	tok, _ := os.ReadFile(filepath.Join(localDir(), "tokenizer.json"))
+	os.WriteFile(filepath.Join(broken, "tokenizer.json"), tok, 0o644)
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + broken}
+	id := firstID(e.must("Users could not sign in after the token refresh.", "add"))
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "1 item(s) waiting") {
+		t.Errorf("the entry should wait for reindex:\n%s", doc)
+	}
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + localDir()}
+	if out := e.must("", "reindex"); !strings.Contains(out, "embedded 1 ") {
+		t.Fatalf("reindex with the model fixed: %q", out)
+	}
+	if out := e.must("", "search", "--fast", "why do logins fail after refreshing credentials"); !strings.HasPrefix(out, id) {
+		t.Errorf("not found by meaning after reindex:\n%s", out)
+	}
+}
+
+// reindex downloads the model's files from the pinned revision, checks
+// them, and refuses a file that is not the one expected.
+func TestModelDownload(t *testing.T) {
+	needLocalModel(t)
+	var corrupt bool
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, f := range localFiles {
+			if r.URL.Path == "/"+localRepo+"/resolve/"+localRev+"/"+f[1] {
+				if corrupt && f[0] == "model.onnx" {
+					io.WriteString(w, "<html>please log in to the hotel wifi</html>")
+					return
+				}
+				http.ServeFile(w, r, filepath.Join(localDir(), f[0]))
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(hub.Close)
+	e := newEnv(t)
+	dir := filepath.Join(t.TempDir(), "model")
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + dir, "JRNL_MODELS_URL=" + hub.URL}
+	corrupt = true // before add, whose background server downloads too
+	e.must("Users could not sign in after the token refresh.", "add")
+	if _, errOut, _ := e.run("", "reindex"); !strings.Contains(errOut, "SHA-256") {
+		t.Errorf("a wrong file should be refused: %q", errOut)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "model.onnx")); err == nil {
+		t.Error("the wrong file was kept")
+	}
+	corrupt = false
+	if out := e.must("", "reindex"); !strings.Contains(out, "embedded 1 ") {
+		t.Fatalf("reindex after downloading: %q", out)
+	}
+}
+
+// Text past the model's 512-token window is cut by tokens, not characters:
+// dense code and accented text alike end within the window, as a prefix of
+// what was given; short text is left alone.
+func TestLocalTokenWindow(t *testing.T) {
+	needLocalModel(t)
+	p, err := local.load(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := strings.Repeat("src/server/services/ServiceMarket.luau:142 0x7f3e9ab2c4 ", 80)
+	accents := strings.Repeat("Résumé café naïve façade über Ångström — ", 120)
+	short := "Users could not sign in after the token refresh."
+	in := []string{code, accents, short}
+	out := fitTokens(p, in)
+	batch := backends.NewBatch(len(out))
+	defer batch.Destroy()
+	backends.TokenizeInputs(batch, p.Model.Tokenizer, out)
+	for i, x := range batch.Input {
+		if n := len(x.TokenIDs); n > 512 {
+			t.Errorf("text %d: %d tokens after cutting, want at most 512", i, n)
+		}
+		if !strings.HasPrefix(in[i], out[i]) || (i < 2 && len(out[i]) < 200) {
+			t.Errorf("text %d: want a long prefix of the original, got %d bytes", i, len(out[i]))
+		}
+	}
+	if out[2] != short {
+		t.Errorf("short text changed: %q", out[2])
+	}
+	if _, err := local.embed([]string{code}, false); err != nil {
+		t.Errorf("embedding long text: %v", err)
 	}
 }

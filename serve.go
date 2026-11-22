@@ -372,15 +372,23 @@ func (sv *server) project(name string) (*served, error) {
 // It waits a moment first, so jrnl add stores its own entry's vector.
 func (sv *server) backfill(p *served) {
 	time.Sleep(backfillDelay)
+	stored := 0
+	ps, err := p.s.Pending("", sv.ai.embedID, "")
 	defer func() {
 		sv.mu.Lock()
 		p.backfilling = false
-		// data_version moves only for other connections' commits, so the
-		// index would not see what this one stored.
-		p.version = -1
+		if stored > 0 {
+			// data_version moves only for other connections' commits, so
+			// the index would not see what this one stored.
+			p.version = -1
+		}
+		if len(ps) == 0 {
+			// Missing vectors with nothing to embed (text that can never be
+			// embedded): look again later, not on every search.
+			p.retryAt = time.Now().Add(10 * time.Minute)
+		}
 		sv.mu.Unlock()
 	}()
-	ps, err := p.s.Pending("", sv.ai.embedID, "")
 	for start := 0; err == nil && start < len(ps); start += 16 {
 		batch := ps[start:min(start+16, len(ps))]
 		ins := make([]Input, len(batch))
@@ -392,6 +400,7 @@ func (sv *server) backfill(p *served) {
 			switch {
 			case errs[i] == nil:
 				err = p.s.SetVec(x.chunkID, vecs[i], sv.ai.embedID)
+				stored++
 			case isPermanent(errs[i]):
 				err = p.s.SetError(x.chunkID, errs[i].Error())
 			default:

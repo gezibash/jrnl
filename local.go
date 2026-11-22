@@ -2,17 +2,22 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/knights-analytics/hugot"
+	"github.com/knights-analytics/hugot/backends"
 	"github.com/knights-analytics/hugot/pipelines"
 )
 
@@ -34,10 +39,13 @@ const (
 	// The model card's instruction for search queries; documents go plain.
 	localQueryPrefix = "Represent this sentence for searching relevant passages: "
 	// The model reads 512 tokens and its tokenizer does not cut the input,
-	// so longer text would run past its position table. About 400 tokens;
-	// keyword search still covers the rest of a long entry.
-	localMaxChars = 1500
-	localSize     = "128 MB"
+	// so longer text would run past its position table: embed cuts it at
+	// this many, after the markers it adds. Keyword search still covers
+	// the rest of a long entry. Characters are a poor proxy: of 154 real
+	// entries one passed 512 tokens at 1,500 characters, and dense code
+	// reaches 667.
+	localMaxTokens = 510
+	localSize      = "128 MB"
 )
 
 // localID names the vectors this embedder makes. Anything that changes them
@@ -45,8 +53,13 @@ const (
 // them and `jrnl reindex` redoes the old ones.
 var localID = localModel + "@local:" + localRev[:7]
 
-// The files the model needs, and where they are in its repository.
-var localFiles = [][2]string{{"model.onnx", "onnx/model.onnx"}, {"tokenizer.json", "tokenizer.json"}}
+// The files the model needs, where they are in its repository, and their
+// SHA-256, checked after download (a proxy or portal can answer 200 with a
+// page of its own).
+var localFiles = [][3]string{
+	{"model.onnx", "onnx/model.onnx", "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35"},
+	{"tokenizer.json", "tokenizer.json", "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"},
+}
 
 func localDir() string {
 	if d := os.Getenv("JRNL_MODEL_DIR"); d != "" {
@@ -83,7 +96,8 @@ func localDownloaded() bool {
 }
 
 type localEmbedder struct {
-	mu  sync.Mutex
+	mu  sync.Mutex // guards p and err
+	run sync.Mutex // one model call at a time: a search and a backfill share it
 	p   *pipelines.FeatureExtractionPipeline
 	err error
 }
@@ -113,7 +127,9 @@ func (l *localEmbedder) load(download bool) (*pipelines.FeatureExtractionPipelin
 			OnnxFilename: "model.onnx", Options: []hugot.FeatureExtractionOption{pipelines.WithNormalization()}})
 	}
 	if err != nil {
-		l.err = permanent{fmt.Errorf("load %s: %w", localModel, err)}
+		// Not permanent: the entries wait for reindex instead of being
+		// marked as text that can never be embedded.
+		l.err = fmt.Errorf("load %s from %s: %w", localModel, localDir(), err)
 	}
 	return l.p, l.err
 }
@@ -124,9 +140,14 @@ func (l *localEmbedder) embed(texts []string, download bool) ([][]float32, error
 	if err != nil {
 		return nil, err
 	}
+	texts = fitTokens(p, texts)
+	// Groups of 4 keep a search behind a backfill waiting tens of
+	// milliseconds, not hundreds.
 	out := make([][]float32, 0, len(texts))
-	for i := 0; i < len(texts); i += 16 {
-		r, err := p.RunPipeline(context.Background(), texts[i:min(i+16, len(texts))])
+	for i := 0; i < len(texts); i += 4 {
+		l.run.Lock()
+		r, err := p.RunPipeline(context.Background(), texts[i:min(i+4, len(texts))])
+		l.run.Unlock()
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", localModel, err)
 		}
@@ -175,10 +196,14 @@ func fetchModel(dir string) error {
 			r.Body.Close()
 			return err
 		}
-		_, err = io.Copy(tmp, r.Body)
+		h := sha256.New()
+		_, err = io.Copy(io.MultiWriter(tmp, h), r.Body)
 		r.Body.Close()
 		if cerr := tmp.Close(); err == nil {
 			err = cerr
+		}
+		if got := hex.EncodeToString(h.Sum(nil)); err == nil && got != f[2] {
+			err = fmt.Errorf("got a file with SHA-256 %s, want %s", got, f[2])
 		}
 		if err == nil {
 			err = os.Rename(tmp.Name(), dst)
@@ -189,4 +214,44 @@ func fetchModel(dir string) error {
 		}
 	}
 	return nil
+}
+
+// fitTokens cuts each text to the model's window. The tokenizer gives no
+// token positions, so a text over the window is cut where its token count
+// says, counted again, and shortened until it fits (about two rounds; only
+// long texts pay).
+func fitTokens(p *pipelines.FeatureExtractionPipeline, texts []string) []string {
+	count := func(xs []string) []int {
+		batch := backends.NewBatch(len(xs))
+		defer batch.Destroy()
+		backends.TokenizeInputs(batch, p.Model.Tokenizer, xs)
+		n := make([]int, len(xs))
+		for i, in := range batch.Input {
+			n[i] = len(in.TokenIDs)
+		}
+		return n
+	}
+	limit := localMaxTokens + 2 // with the [CLS] and [SEP] markers
+	var out []string
+	for i, n := range count(texts) {
+		t := texts[i]
+		for n > limit {
+			cut := len(t) * (limit - 8) / n
+			for cut > 0 && !utf8.RuneStart(t[cut]) {
+				cut--
+			}
+			t = t[:cut]
+			n = count([]string{t})[0]
+		}
+		if t != texts[i] {
+			if out == nil {
+				out = slices.Clone(texts)
+			}
+			out[i] = t
+		}
+	}
+	if out == nil {
+		return texts
+	}
+	return out
 }

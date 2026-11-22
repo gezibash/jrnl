@@ -71,10 +71,10 @@ func format(model string, in Input) string {
 		if in.Query {
 			t = localQueryPrefix + in.Text
 		}
-		if len(t) > localMaxChars {
-			t = strings.ToValidUTF8(t[:localMaxChars], "")
+		if len(t) > maxDocChars {
+			t = strings.ToValidUTF8(t[:maxDocChars], "")
 		}
-		return t
+		return t // cut to the model's window by tokens, in local.embed
 	case strings.Contains(m, "embeddinggemma"):
 		t = "title: " + in.Title + " | text: " + in.Text
 		if in.Query {
