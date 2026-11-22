@@ -1,3 +1,4 @@
 /jrnl
 *.test
 dist/
+/jr
