@@ -270,10 +270,10 @@ type gate struct{ both, alone float32 }
 // the 6. Few questions, so the margins are thin.
 var (
 	gemmaGate = gate{0.68, 0.72} // embeddinggemma-2
-	// bge-small-en-v1.5 through jrnl serve's ranking, refitted 2026-11-22 on
-	// the same 27 questions plus 18 unrelated ones: 23 of 27 shown, 1 of 18
-	// unrelated shows a hit (potion-base-32M: 24 and 2).
-	localGate = gate{0.60, 0.60}
+	// bge-small-en-v1.5 ([CLS] pooling) through jrnl serve's ranking, fitted
+	// 2026-11-22 on the same 27 questions plus 18 unrelated ones: 25 of 27
+	// shown, 2 of 18 unrelated show a hit (potion-base-32M: 24 and 2).
+	localGate = gate{0.64, 0.64}
 )
 
 // gateFor is the gate fitted for an embedding model; models never fitted

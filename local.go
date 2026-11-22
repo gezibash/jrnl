@@ -51,7 +51,7 @@ const (
 // localID names the vectors this embedder makes. Anything that changes them
 // (model, revision, the text recipe) needs a new ID, so search never mixes
 // them and `jrnl reindex` redoes the old ones.
-var localID = localModel + "@local:" + localRev[:7]
+var localID = localModel + "@local:" + localRev[:7] + ":cls"
 
 // The files the model needs, where they are in its repository, and their
 // SHA-256, checked after download (a proxy or portal can answer 200 with a
@@ -124,7 +124,7 @@ func (l *localEmbedder) load(download bool) (*pipelines.FeatureExtractionPipelin
 	s, err := hugot.NewGoSession(context.Background())
 	if err == nil {
 		l.p, err = hugot.NewPipeline(s, hugot.FeatureExtractionConfig{ModelPath: localDir(), Name: localModel,
-			OnnxFilename: "model.onnx", Options: []hugot.FeatureExtractionOption{pipelines.WithNormalization()}})
+			OnnxFilename: "model.onnx"})
 	}
 	if err != nil {
 		// Not permanent: the entries wait for reindex instead of being
@@ -146,12 +146,16 @@ func (l *localEmbedder) embed(texts []string, download bool) ([][]float32, error
 	out := make([][]float32, 0, len(texts))
 	for i := 0; i < len(texts); i += 4 {
 		l.run.Lock()
-		r, err := p.RunPipeline(context.Background(), texts[i:min(i+4, len(texts))])
+		// The model is trained for its first token's state ([CLS]), not the
+		// mean: on the tycoon set, right entry first for 24 of 27 against 23.
+		r, err := p.RunRaw(context.Background(), texts[i:min(i+4, len(texts))])
 		l.run.Unlock()
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", localModel, err)
 		}
-		out = append(out, r.Embeddings...)
+		for _, h := range r.HiddenStates {
+			out = append(out, normalize(h[0]))
+		}
 	}
 	return out, nil
 }
