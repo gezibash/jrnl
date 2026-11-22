@@ -35,7 +35,7 @@ const usage = `jrnl — per-project journal
   jrnl list [filters]          newest first; --oldest for oldest first
   jrnl search [filters] QUERY  keyword + semantic search over entries and attachment descriptions
       --newest | --oldest      the latest / the first matches, instead of the best
-      --fast                   no reranker (about 0.2 s, not 0.6 s); implies --min-score 0.65
+      --fast                   no reranker, and only hits that clearly match (see jrnl serve)
       --min-score S            drop hits whose meaning score (cosine) is under S
   jrnl search --like FILE      find attachments whose description is like FILE's
   jrnl sessions [filters]      recent sessions: last active, how many entries, last title
@@ -46,6 +46,7 @@ const usage = `jrnl — per-project journal
   jrnl backup                  consistent copy of the database
   jrnl where                   print this project's journal directory
   jrnl doctor                  what is set up, and how to turn on the rest
+  jrnl serve [--background]    answer fast searches from memory over ~/.journal/.run/jrnl.sock (for agent hooks)
   jrnl version
 
 filters: --since WHEN  --until WHEN  --on WHEN
@@ -83,7 +84,7 @@ func main() {
 		"add": cmdAdd, "show": cmdShow, "read": cmdShow, "open": cmdShow, "list": cmdList, "ls": cmdList, "search": cmdSearch,
 		"reindex": cmdReindex, "backup": cmdBackup, "where": cmdWhere,
 		"sessions": cmdSessions, "stats": cmdStats, "close": cmdClose, "reopen": cmdReopen,
-		"summarize": cmdSummarize, "summarise": cmdSummarize, "doctor": cmdDoctor,
+		"summarize": cmdSummarize, "summarise": cmdSummarize, "doctor": cmdDoctor, "serve": cmdServe,
 	}
 	name := os.Args[1]
 	if name == "version" || name == "--version" {
@@ -488,14 +489,6 @@ func cmdSearch(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *minScore < 0 {
-		*minScore = 0
-		if *fast {
-			// EmbeddingGemma 2 on a 100-entry journal: questions about real
-			// entries scored 0.72-0.85, unrelated ones 0.56-0.60.
-			*minScore = 0.65
-		}
-	}
 	q := strings.TrimSpace(strings.Join(pos, " "))
 	if q == "" && *like == "" {
 		return fmt.Errorf("search: give a query, or --like FILE")
@@ -559,6 +552,18 @@ func cmdSearch(args []string) error {
 			fmt.Fprintf(os.Stderr, "jrnl: keyword search only: %v\n", aiErr)
 		}
 	}
+	if *fast && *like == "" && order == "" {
+		g := gemmaGate
+		if *minScore >= 0 {
+			g = gate{float32(*minScore), float32(*minScore)}
+		}
+		hits, err := fastSearch(s, q, qvec, s.chunkVecs(embedder, modalities, *f), *f, g, *limit)
+		if err != nil {
+			return err
+		}
+		printHits(os.Stdout, hits)
+		return nil
+	}
 	hits, err := s.Search(q, qvec, embedder, modalities, *f, order)
 	if err != nil {
 		return err
@@ -569,7 +574,7 @@ func cmdSearch(args []string) error {
 	if qvec != nil && *minScore > 0 {
 		hits = slices.DeleteFunc(hits, func(h Hit) bool { return float64(h.Sim) < *minScore })
 	}
-	if qvec != nil && q != "" && len(hits) > 1 && !*fast {
+	if qvec != nil && q != "" && len(hits) > 1 {
 		k := min(*limit, 20)
 		if order != "" {
 			k = 0 // every relevant entry; sorted by date below
@@ -598,18 +603,22 @@ func cmdSearch(args []string) error {
 	if len(hits) > *limit {
 		hits = hits[:*limit]
 	}
+	printHits(os.Stdout, hits)
+	return nil
+}
+
+func printHits(w io.Writer, hits []Hit) {
 	for _, h := range hits {
-		fmt.Printf("%s  (%s)\n", summaryLine(h.Entry), strings.Join(h.Via, "+"))
+		fmt.Fprintf(w, "%s  (%s)\n", summaryLine(h.Entry), strings.Join(h.Via, "+"))
 		if h.Snippet != "" {
-			fmt.Printf("    %s\n", oneLine(h.Snippet))
+			fmt.Fprintf(w, "    %s\n", oneLine(h.Snippet))
 		} else if h.Entry.Body != "" {
-			fmt.Printf("    %s\n", truncate(oneLine(h.Entry.Body), 160))
+			fmt.Fprintf(w, "    %s\n", truncate(oneLine(h.Entry.Body), 160))
 		}
 		if h.Match != "" {
-			fmt.Printf("    matched %s\n", h.Match)
+			fmt.Fprintf(w, "    matched %s\n", h.Match)
 		}
 	}
-	return nil
 }
 
 func cmdReindex(args []string) error {
@@ -683,18 +692,86 @@ func git(args ...string) string {
 }
 
 // detectGit names the project after its origin remote, so every worktree and
-// clone of one repository shares a journal.
+// clone of one repository shares a journal. A plain repository is read from
+// its .git directory: each git process costs 70-180 ms on a Mac with
+// endpoint security, three of them per command. Anything else (a worktree or
+// submodule, whose .git is a file) asks git.
 func detectGit() gitInfo {
+	wd, _ := os.Getwd()
+	for dir := wd; ; dir = filepath.Dir(dir) {
+		st, err := os.Stat(filepath.Join(dir, ".git"))
+		if err == nil && st.IsDir() {
+			return readGitDir(dir)
+		}
+		if err == nil || filepath.Dir(dir) == dir {
+			break
+		}
+	}
 	g := gitInfo{branch: git("branch", "--show-current"), commit: git("rev-parse", "--short", "HEAD")}
 	if r := git("remote", "get-url", "origin"); r != "" {
 		g.project = slugFromRemote(r)
 	} else if top := git("rev-parse", "--show-toplevel"); top != "" {
 		g.project = slug(filepath.Base(top))
 	} else {
-		wd, _ := os.Getwd()
 		g.project = slug(filepath.Base(wd))
 	}
 	return g
+}
+
+// readGitDir reads the origin URL, branch and commit of the repository at
+// top from its .git directory.
+func readGitDir(top string) gitInfo {
+	gd := filepath.Join(top, ".git")
+	g := gitInfo{project: slug(filepath.Base(top))}
+	if url := originURL(gd); url != "" {
+		g.project = slugFromRemote(url)
+	}
+	head, _ := os.ReadFile(filepath.Join(gd, "HEAD"))
+	ref, isRef := strings.CutPrefix(strings.TrimSpace(string(head)), "ref: ")
+	sha := ref
+	if isRef {
+		g.branch = strings.TrimPrefix(ref, "refs/heads/")
+		sha = resolveRef(gd, ref)
+	}
+	if len(sha) >= 7 {
+		g.commit = sha[:7]
+	}
+	return g
+}
+
+// originURL is the url of [remote "origin"] in the repository's config.
+func originURL(gd string) string {
+	b, err := os.ReadFile(filepath.Join(gd, "config"))
+	if err != nil {
+		return ""
+	}
+	inOrigin := false
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			inOrigin = line == `[remote "origin"]`
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); inOrigin && ok && strings.TrimSpace(k) == "url" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// resolveRef finds the commit a ref names, loose or in packed-refs; "" for
+// a branch with no commits yet.
+func resolveRef(gd, ref string) string {
+	if b, err := os.ReadFile(filepath.Join(gd, filepath.FromSlash(ref))); err == nil {
+		return strings.TrimSpace(string(b))
+	}
+	b, _ := os.ReadFile(filepath.Join(gd, "packed-refs"))
+	for _, line := range strings.Split(string(b), "\n") {
+		if sha, name, ok := strings.Cut(strings.TrimSpace(line), " "); ok && name == ref {
+			return sha
+		}
+	}
+	return ""
 }
 
 func slugFromRemote(r string) string {

@@ -4,13 +4,17 @@ package main
 // boundary Claude uses.
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	potion "github.com/trengrj/go-potion"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -287,6 +291,7 @@ type env struct {
 	config string   // config.toml; by default Cloudflare media vectors from the fake server
 	extra  []string // more environment, such as JRNL_CHAT_URL=...
 	path   string   // PATH for jrnl, when a test hides tools such as ffmpeg
+	dir    string   // working directory; when set, jrnl names the project itself
 }
 
 func newEnv(t *testing.T) *env {
@@ -307,6 +312,10 @@ model    = "@cf/google/embeddinggemma-2"
 
 func (e *env) run(stdin string, args ...string) (string, string, error) {
 	cmd := exec.Command(bin, append(args, "--project", "test")...)
+	if e.dir != "" {
+		cmd = exec.Command(bin, args...)
+		cmd.Dir = e.dir
+	}
 	cmd.Env = append(os.Environ(), "JRNL_HOME="+e.home, "OLLAMA_HOST="+e.ollama,
 		// A fixed clock and zone: Thursday 2026-11-19, 15:30 in Berlin (UTC+1).
 		"TZ=Europe/Berlin", "JRNL_NOW=2026-11-19T15:30:00+01:00", "CLAUDECODE=", "CLAUDE_CODE_SESSION_ID=sess-1")
@@ -1414,5 +1423,226 @@ func TestFastSearchSkipsRerankAndCutsByScore(t *testing.T) {
 	}
 	if len(e.ai.chatReqs) != chats {
 		t.Errorf("--fast should not call the chat model to rerank")
+	}
+}
+
+// A plain repository is read from its .git directory: the project comes from
+// the origin remote, and an entry records the branch and short commit, from
+// a subfolder and with refs packed. The expected values come from git itself.
+func TestProjectBranchAndCommitFromGit(t *testing.T) {
+	e := newEnv(t)
+	repo := t.TempDir()
+	gitc := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	gitc("init", "-q", "-b", "feature/x")
+	gitc("remote", "add", "upstream", "git@github.com:other/wrong.git")
+	gitc("remote", "add", "origin", "https://github.com/Acme/Widget.git")
+	os.MkdirAll(filepath.Join(repo, "sub", "dir"), 0o755)
+	e.dir = filepath.Join(repo, "sub", "dir")
+	e.path = t.TempDir() // no git for jrnl: it must read .git itself
+
+	// No commit yet: project and branch, no commit.
+	if out := e.must("", "where"); !strings.HasSuffix(strings.TrimSpace(out), "acme-widget") {
+		t.Errorf("where = %q, want the origin slug acme-widget", out)
+	}
+	gitc("commit", "-q", "--allow-empty", "-m", "one")
+	gitc("pack-refs", "--all")
+	want := gitc("rev-parse", "--short=7", "HEAD")
+	out := e.must("", "show", firstID(e.must("an entry", "add")))
+	for _, line := range []string{`branch: "feature/x"`, "commit: " + want} {
+		if !strings.Contains(out, line+"\n") {
+			t.Errorf("show is missing %q:\n%s", line, out)
+		}
+	}
+	// Detached HEAD: no branch, the commit still recorded.
+	gitc("checkout", "-q", "--detach")
+	out = e.must("", "show", firstID(e.must("detached", "add")))
+	if strings.Contains(out, "branch:") || !strings.Contains(out, "commit: "+want+"\n") {
+		t.Errorf("detached HEAD should record the commit and no branch:\n%s", out)
+	}
+}
+
+// jrnl serve answers over a Unix socket that only this user can open; sees
+// entries other processes add; finds an exact identifier and a reworded
+// question; shows nothing for an unrelated one; and never creates a journal
+// for a project it is asked about. Uses the real potion model, so it runs
+// only where the model is cached.
+func TestServe(t *testing.T) {
+	cache, _ := os.UserCacheDir()
+	if _, err := os.Stat(filepath.Join(cache, "go-potion", "BASE32M", "model.safetensors")); err != nil {
+		t.Skip("potion BASE32M not cached; run jrnl serve once to fetch it")
+	}
+	e := newEnv(t)
+	// A short home: a Unix socket path has a 104-byte limit on macOS.
+	home, err := os.MkdirTemp("/tmp", "jrs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	e.home = home
+	login := firstID(e.must("Users could not sign in after the token refresh.", "add", "--kind", "bug"))
+	e.must("Chose Go over Bun for the CLI.", "add", "--kind", "decision")
+
+	srv := exec.Command(bin, "serve")
+	srv.Env = append(os.Environ(), "JRNL_HOME="+home)
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Process.Kill(); srv.Wait() })
+	sock := filepath.Join(home, ".run", "jrnl.sock")
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+	}}}
+	search := func(project, q string) (int, string) {
+		r, err := client.Get("http://jrnl/search?" + url.Values{"project": {project}, "q": {q}}.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		b, _ := io.ReadAll(r.Body)
+		return r.StatusCode, string(b)
+	}
+	for i := 0; ; i++ {
+		if _, err := client.Get("http://jrnl/health"); err == nil {
+			break
+		}
+		if i == 100 {
+			t.Fatal("jrnl serve did not answer within 10 s")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if st, _ := os.Stat(sock); st.Mode().Perm() != 0o600 {
+		t.Errorf("socket mode %v, want 0600", st.Mode().Perm())
+	}
+
+	if _, out := search("test", "sign in fails after a token refresh"); !strings.HasPrefix(out, login) {
+		t.Errorf("a reworded question should find the sign-in entry first:\n%s", out)
+	}
+	if _, out := search("test", "kubernetes pod keeps restarting"); out != "" {
+		t.Errorf("an unrelated question should show nothing:\n%s", out)
+	}
+	// Written by another process while the server runs: found by meaning,
+	// which needs its vector, and by an identifier no embedding can place.
+	card := firstID(e.must("Payments failed when the customer's card had expired.", "add", "--kind", "bug"))
+	if _, out := search("test", "billing broke because of an expired credit card"); !strings.HasPrefix(out, card) {
+		t.Errorf("an entry added meanwhile should be found by meaning:\n%s", out)
+	}
+	// A long entry, as real ones are: the identifier is a small part of its vector.
+	hex := firstID(e.must("Crash on start after the upgrade\n\nThe crash report 7f3e9ab2c4 came from the old build that "+
+		"still shipped the previous renderer. Players on older phones saw a black screen for a few seconds, then the "+
+		"app closed. We rolled the renderer back, rebuilt the asset bundle, cleared the shader cache on first launch "+
+		"and asked the store to expedite the review. Support answered every ticket with the workaround meanwhile.", "add", "--kind", "bug"))
+	if _, out := search("test", "7f3e9ab2c4"); !strings.HasPrefix(out, hex) {
+		t.Errorf("an exact identifier should be found:\n%s", out)
+	}
+	if code, _ := search("nobody", "anything at all here"); code != http.StatusNotFound {
+		t.Errorf("an unknown project should be 404, got %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(home, "nobody")); err == nil {
+		t.Errorf("serve created a journal for a project it was only asked about")
+	}
+}
+
+// The server keeps its index current when the newest entry is deleted and
+// another added: SQLite then reuses the deleted row's number, so the new
+// row is not "after the last one indexed" and the count is unchanged.
+func TestServeIndexAfterDeletingNewest(t *testing.T) {
+	cache, _ := os.UserCacheDir()
+	if _, err := os.Stat(filepath.Join(cache, "go-potion", "BASE32M", "model.safetensors")); err != nil {
+		t.Skip("potion BASE32M not cached")
+	}
+	t.Setenv("JRNL_HOME", t.TempDir())
+	s, err := Open("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := func(body string) string {
+		e := Entry{ID: newID(), TS: time.Now().UTC().Format(time.RFC3339), Project: "p", Kind: "note", Title: firstLine(body), Body: body}
+		if err := s.Insert(e, nil); err != nil {
+			t.Fatal(err)
+		}
+		return e.ID
+	}
+	add("Chose Go over Bun for the CLI.")
+	old := add("Payments failed when the customer's card had expired.")
+	enc, err := potion.New(context.Background(), serveModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sv := newServer(enc)
+	if _, err := sv.search("p", "expired card payments failed", 5); err != nil {
+		t.Fatal(err)
+	}
+	// Another process: delete the newest entry, add one.
+	if err := s.Delete(old); err != nil {
+		t.Fatal(err)
+	}
+	fresh := add("Webhook signatures were rejected after rotating the secret.")
+	hits, err := sv.search("p", "webhook signatures rejected after rotating the secret", 5)
+	if err != nil {
+		t.Fatalf("search after delete and add: %v", err)
+	}
+	if len(hits) == 0 || hits[0].Entry.ID != fresh {
+		t.Errorf("want the new entry first, got %v", hits)
+	}
+}
+
+// A journal not searched for a while is closed and dropped from memory,
+// one searched since stays, and the next search of the dropped one reloads
+// it with whatever was written meanwhile.
+func TestServeUnloadsIdleJournals(t *testing.T) {
+	cache, _ := os.UserCacheDir()
+	if _, err := os.Stat(filepath.Join(cache, "go-potion", "BASE32M", "model.safetensors")); err != nil {
+		t.Skip("potion BASE32M not cached")
+	}
+	t.Setenv("JRNL_HOME", t.TempDir())
+	add := func(project, body string) string {
+		s, err := Open(project)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		e := Entry{ID: newID(), TS: time.Now().UTC().Format(time.RFC3339), Project: project, Kind: "note", Title: firstLine(body), Body: body}
+		if err := s.Insert(e, nil); err != nil {
+			t.Fatal(err)
+		}
+		return e.ID
+	}
+	add("idle", "Chose Go over Bun for the CLI.")
+	add("busy", "Users could not sign in after the token refresh.")
+	enc, err := potion.New(context.Background(), serveModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sv := newServer(enc)
+	if _, err := sv.search("idle", "why go over bun", 5); err != nil {
+		t.Fatal(err)
+	}
+	cutoff := time.Now()
+	if _, err := sv.search("busy", "sign in fails after token refresh", 5); err != nil {
+		t.Fatal(err)
+	}
+	sv.unload(cutoff)
+	if _, ok := sv.projects["idle"]; ok {
+		t.Error("the journal unsearched since the cutoff is still loaded")
+	}
+	if _, ok := sv.projects["busy"]; !ok {
+		t.Error("the journal searched after the cutoff was unloaded")
+	}
+	card := add("idle", "Payments failed when the customer's card had expired.")
+	hits, err := sv.search("idle", "billing broke because of an expired credit card", 5)
+	if err != nil {
+		t.Fatalf("search after unload: %v", err)
+	}
+	if len(hits) == 0 || hits[0].Entry.ID != card {
+		t.Errorf("want the entry written while unloaded first, got %v", hits)
 	}
 }

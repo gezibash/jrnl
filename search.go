@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -57,15 +58,76 @@ func ftsQuery(q, op string) string {
 // required if any entry has them all. On the 20,000-entry test, relevance
 // order put the newest of 351 "Redis cluster" entries nowhere in the top 5.
 func (s *Store) Search(q string, qvec []float32, embedder string, modalities []string, f Filter, order string) ([]Hit, error) {
+	cands, err := s.rank(q, qvec, s.chunkVecs(embedder, modalities, f), f, order)
+	if err != nil {
+		return nil, err
+	}
+	return s.hits(cands)
+}
+
+// candidate is a ranked search result before its entry is loaded.
+type candidate struct {
+	id, snippet, match string
+	score              float64
+	sim                float32
+	via                []string
+	allTerms           bool // the entry has every query term
+}
+
+// vecSource calls yield with each vector the search compares the query to:
+// an entry, the piece it came from ("text", or "image:<hash>"), the vector.
+type vecSource func(yield func(id, piece string, vec []float32)) error
+
+// chunkVecs reads the vectors stored by embedder for the given modalities.
+func (s *Store) chunkVecs(embedder string, modalities []string, f Filter) vecSource {
+	return func(yield func(id, piece string, vec []float32)) error {
+		w, args, err := f.where()
+		if err != nil {
+			return err
+		}
+		marks := strings.TrimSuffix(strings.Repeat("?,", len(modalities)), ",")
+		margs := []any{embedder}
+		for _, m := range modalities {
+			margs = append(margs, m)
+		}
+		rows, err := s.db.Query(`SELECT c.entry_id, c.modality, c.hash, c.vec FROM chunks c
+			JOIN entries e ON e.id = c.entry_id
+			WHERE c.vec IS NOT NULL AND c.embedder = ? AND c.modality IN (`+marks+`) AND `+w, append(margs, args...)...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, modality, hash string
+			var blob []byte
+			if err := rows.Scan(&id, &modality, &hash, &blob); err != nil {
+				return err
+			}
+			piece := modality
+			if hash != "" {
+				piece = modality + ":" + hash
+			}
+			yield(id, piece, decodeVec(blob))
+		}
+		return rows.Err()
+	}
+}
+
+// rank fuses keyword and vector ranks (RRF) without loading any entry.
+func (s *Store) rank(q string, qvec []float32, vecs vecSource, f Filter, order string) ([]candidate, error) {
 	w, args, err := f.where()
 	if err != nil {
 		return nil, err
 	}
-	scores := map[string]float64{}
-	via := map[string][]string{}
-	snippets := map[string]string{}
-	match := map[string]string{}
-	sims := map[string]float32{}
+	byID := map[string]*candidate{}
+	get := func(id string) *candidate {
+		c := byID[id]
+		if c == nil {
+			c = &candidate{id: id}
+			byID[id] = c
+		}
+		return c
+	}
 
 	sortBy := "bm25(entries_fts)"
 	switch order {
@@ -100,47 +162,48 @@ func (s *Store) Search(q string, qvec []float32, embedder string, modalities []s
 				return nil, err
 			}
 			rank++
-			scores[id] += 1.0 / float64(rrfK+rank)
-			via[id] = append(via[id], "keyword")
-			snippets[id] = snip
+			c := get(id)
+			c.score += 1.0 / float64(rrfK+rank)
+			c.via = append(c.via, "keyword")
+			c.snippet = snip
+		}
+		rows.Close()
+	}
+
+	if all := ftsQuery(q, "AND"); all != "" && order == "" {
+		rows, err := s.db.Query(`SELECT e.id FROM entries_fts JOIN entries e ON e.id = entries_fts.entry_id
+			WHERE entries_fts MATCH ? AND `+w+` LIMIT ?`, append(append([]any{all}, args...), kwCandidates)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if c := byID[id]; c != nil {
+				c.allTerms = true
+			}
 		}
 		rows.Close()
 	}
 
 	if qvec != nil {
-		marks := strings.TrimSuffix(strings.Repeat("?,", len(modalities)), ",")
-		margs := []any{embedder}
-		for _, m := range modalities {
-			margs = append(margs, m)
-		}
-		rows, err := s.db.Query(`SELECT c.entry_id, c.modality, c.hash, c.vec FROM chunks c
-			JOIN entries e ON e.id = c.entry_id
-			WHERE c.vec IS NOT NULL AND c.embedder = ? AND c.modality IN (`+marks+`) AND `+w, append(margs, args...)...)
-		if err != nil {
-			return nil, err
-		}
 		type best struct {
 			id, piece string
 			sim       float32
 		}
 		bestBy := map[string]*best{}
-		for rows.Next() {
-			var id, modality, hash string
-			var blob []byte
-			if err := rows.Scan(&id, &modality, &hash, &blob); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			sim := dot(qvec, decodeVec(blob))
+		err := vecs(func(id, piece string, vec []float32) {
+			sim := dot(qvec, vec)
 			if b, ok := bestBy[id]; !ok || sim > b.sim {
-				piece := modality
-				if hash != "" {
-					piece = modality + ":" + hash
-				}
 				bestBy[id] = &best{id, piece, sim}
 			}
+		})
+		if err != nil {
+			return nil, err
 		}
-		rows.Close()
 		ranked := make([]*best, 0, len(bestBy))
 		for _, b := range bestBy {
 			ranked = append(ranked, b)
@@ -150,32 +213,38 @@ func (s *Store) Search(q string, qvec []float32, embedder string, modalities []s
 			ranked = ranked[:vecCandidates]
 		}
 		for i, b := range ranked {
-			scores[b.id] += 1.0 / float64(rrfK+i+1)
-			via[b.id] = append(via[b.id], "vector")
-			match[b.id] = b.piece
-			sims[b.id] = b.sim
+			c := get(b.id)
+			c.score += 1.0 / float64(rrfK+i+1)
+			c.via = append(c.via, "vector")
+			c.match = b.piece
+			c.sim = b.sim
 		}
 	}
 
-	ids := make([]string, 0, len(scores))
-	for id := range scores {
-		ids = append(ids, id)
+	cands := make([]candidate, 0, len(byID))
+	for _, c := range byID {
+		cands = append(cands, *c)
 	}
-	sort.Slice(ids, func(i, j int) bool {
-		if scores[ids[i]] != scores[ids[j]] {
-			return scores[ids[i]] > scores[ids[j]]
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].score != cands[j].score {
+			return cands[i].score > cands[j].score
 		}
-		return ids[i] > ids[j] // newer first on ties
+		return cands[i].id > cands[j].id // newer first on ties
 	})
-	hits := make([]Hit, 0, len(ids))
-	for _, id := range ids {
-		e, err := s.Get(id)
+	return cands, nil
+}
+
+// hits loads the entries of ranked candidates.
+func (s *Store) hits(cands []candidate) ([]Hit, error) {
+	hits := make([]Hit, 0, len(cands))
+	for _, c := range cands {
+		e, err := s.Get(c.id)
 		if err != nil {
 			return nil, err
 		}
-		h := Hit{Entry: e, Score: scores[id], Sim: sims[id], Via: via[id], Snippet: snippets[id]}
+		h := Hit{Entry: e, Score: c.score, Sim: c.sim, Via: c.via, Snippet: c.snippet}
 		// Name the attachment that matched, so the reader can open it.
-		if m := match[id]; strings.Contains(m, ":") {
+		if m := c.match; strings.Contains(m, ":") {
 			hash := m[strings.IndexByte(m, ':')+1:]
 			for _, a := range e.Assets {
 				if hash != "" && a.Hash == hash {
@@ -186,4 +255,47 @@ func (s *Store) Search(q string, qvec []float32, embedder string, modalities []s
 		hits = append(hits, h)
 	}
 	return hits, nil
+}
+
+// gate decides which fast-search candidates are shown: those with every
+// query term (an identifier such as CarryPose, which a static embedding
+// cannot place), those both signals found with a meaning score of at least
+// both, or the vector alone with at least alone. Neither signal alone separates: on the test set below,
+// unrelated questions scored up to 0.72 with EmbeddingGemma, and some
+// answers as low as 0.71.
+type gate struct{ both, alone float32 }
+
+// Fitted on 27 reworded questions and 6 unrelated ones over a 100-entry
+// journal (2026-11-22): each shows the answer for 23 of 27 and nothing for
+// the 6. Few questions, so the margins are thin.
+var (
+	gemmaGate  = gate{0.68, 0.72} // embeddinggemma-2
+	potionGate = gate{0.34, 0.36} // potion-base-32M
+)
+
+func (g gate) keep(c candidate) bool {
+	both := slices.Contains(c.via, "keyword") && slices.Contains(c.via, "vector")
+	return c.allTerms || (both && c.sim >= g.both) || c.sim >= g.alone
+}
+
+// fastSearch ranks without a reranker, keeps what passes the gate and loads
+// only the entries it returns.
+func fastSearch(s *Store, q string, qvec []float32, vecs vecSource, f Filter, g gate, limit int) ([]Hit, error) {
+	cands, err := s.rank(q, qvec, vecs, f, "")
+	if err != nil {
+		return nil, err
+	}
+	return s.hits(gateCut(cands, qvec != nil, g, limit))
+}
+
+// gateCut keeps the candidates that pass the gate (all of them without a
+// query vector), at most limit.
+func gateCut(cands []candidate, hasVec bool, g gate, limit int) []candidate {
+	if hasVec {
+		cands = slices.DeleteFunc(cands, func(c candidate) bool { return !g.keep(c) })
+	}
+	if len(cands) > limit {
+		cands = cands[:limit]
+	}
+	return cands
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	mrand "math/rand/v2"
 	"mime"
 	"os"
 	"path/filepath"
@@ -126,7 +127,14 @@ func Open(project string) (*Store, error) {
 	}
 	// Creation and upgrades run under the write lock, so two first runs don't
 	// race; the version is read again once the lock is held.
+	// Switching a new database to WAL can fail with SQLITE_BUSY at once,
+	// without waiting, while another process creates it (10 of 500 parallel
+	// first runs); those retry.
 	tx, err := db.Begin()
+	for i := 0; err != nil && strings.Contains(err.Error(), "SQLITE_BUSY") && i < 100; i++ {
+		time.Sleep(time.Duration(10+mrand.IntN(20)) * time.Millisecond)
+		tx, err = db.Begin()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", dir, err)
 	}
