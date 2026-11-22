@@ -49,9 +49,12 @@ var schema = []string{
 		PRIMARY KEY (entry_id, tag)
 	)`,
 	`CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag)`,
+	// type: relates (--link), supersedes (src replaces dst: a thread of
+	// decisions) or closes (a close note and the entry it closed).
 	`CREATE TABLE IF NOT EXISTS links (
 		src TEXT NOT NULL REFERENCES entries(id),
 		dst TEXT NOT NULL,
+		type TEXT NOT NULL DEFAULT 'relates',
 		PRIMARY KEY (src, dst)
 	)`,
 	`CREATE TABLE IF NOT EXISTS files (
@@ -152,6 +155,7 @@ func Open(project string) (*Store, error) {
 			{"entries", "status", "TEXT NOT NULL DEFAULT ''"},
 			{"entries", "closed_at", "TEXT NOT NULL DEFAULT ''"},
 			{"entries", "closed_by", "TEXT NOT NULL DEFAULT ''"},
+			{"links", "type", "TEXT NOT NULL DEFAULT 'relates'"},
 		} {
 			if err := addColumn(tx, c.table, c.col, c.def); err != nil {
 				return nil, fmt.Errorf("upgrade: %w", err)
@@ -180,6 +184,14 @@ func Open(project string) (*Store, error) {
 			return nil, fmt.Errorf("upgrade: %w", err)
 		}
 	}
+	if v > 0 && v < 5 {
+		// Before 5, links had no type. A close note's link to what it closed
+		// is known from closed_by; every other link stays relates.
+		if _, err := tx.Exec(`UPDATE links SET type = 'closes'
+			WHERE EXISTS (SELECT 1 FROM entries e WHERE e.id = links.dst AND e.closed_by = links.src)`); err != nil {
+			return nil, fmt.Errorf("upgrade: %w", err)
+		}
+	}
 	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return nil, err
 	}
@@ -187,8 +199,9 @@ func Open(project string) (*Store, error) {
 }
 
 // 1: first release. 2: open/closed status on entries. 3: text embedders
-// named by model and host. 4: media embedders named the same way.
-const schemaVersion = 4
+// named by model and host. 4: media embedders named the same way. 5: typed
+// links (relates, supersedes, closes).
+const schemaVersion = 5
 
 func addColumn(tx *sql.Tx, table, col, def string) error {
 	var n int
@@ -255,11 +268,36 @@ var mediaTypes = map[string]string{
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// Link sets the link from src to dst, replacing its type if it has one.
+func (s *Store) Link(src, dst, typ string) error {
+	if src == dst {
+		return fmt.Errorf("an entry cannot link to itself")
+	}
+	_, err := s.db.Exec(`INSERT INTO links (src, dst, type) VALUES (?,?,?)
+		ON CONFLICT (src, dst) DO UPDATE SET type = excluded.type`, src, dst, typ)
+	return err
+}
+
+// Unlink removes the link between a and b, in either direction. It says
+// whether there was one.
+func (s *Store) Unlink(a, b string) (bool, error) {
+	r, err := s.db.Exec(`DELETE FROM links WHERE (src = ? AND dst = ?) OR (src = ? AND dst = ?)`, a, b, b, a)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n > 0, err
+}
+
 type Entry struct {
 	ID, TS, Project, Session, Author, Kind, Branch, Commit, Title, Body string
 	Status, ClosedAt, ClosedBy                                          string
 	Tags, Links, LinkedFrom, Files                                      []string
-	Assets                                                              []Asset
+	// Supersedes: the entries this one replaces; SupersededBy: those that
+	// replace it. Links and LinkedFrom hold the other types.
+	Supersedes, SupersededBy []string
+	Closes                   []string // written only: a close note's entries
+	Assets                   []Asset
 }
 
 type Asset struct {
@@ -347,9 +385,11 @@ func (s *Store) Insert(e Entry, chunks []Chunk) error {
 			return err
 		}
 	}
-	for _, l := range e.Links {
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO links VALUES (?,?)`, e.ID, l); err != nil {
-			return err
+	for typ, ids := range map[string][]string{"relates": e.Links, "supersedes": e.Supersedes, "closes": e.Closes} {
+		for _, l := range ids {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO links (src, dst, type) VALUES (?,?,?)`, e.ID, l, typ); err != nil {
+				return err
+			}
 		}
 	}
 	for _, f := range e.Files {
@@ -498,8 +538,10 @@ func (s *Store) Get(id string) (Entry, error) {
 		return e, err
 	}
 	e.Tags = s.strings(`SELECT tag FROM tags WHERE entry_id = ? ORDER BY tag`, id)
-	e.Links = s.strings(`SELECT dst FROM links WHERE src = ? ORDER BY dst`, id)
-	e.LinkedFrom = s.strings(`SELECT src FROM links WHERE dst = ? ORDER BY src`, id)
+	e.Links = s.strings(`SELECT dst FROM links WHERE src = ? AND type != 'supersedes' ORDER BY dst`, id)
+	e.LinkedFrom = s.strings(`SELECT src FROM links WHERE dst = ? AND type != 'supersedes' ORDER BY src`, id)
+	e.Supersedes = s.strings(`SELECT dst FROM links WHERE src = ? AND type = 'supersedes' ORDER BY dst`, id)
+	e.SupersededBy = s.strings(`SELECT src FROM links WHERE dst = ? AND type = 'supersedes' ORDER BY src`, id)
 	e.Files = s.strings(`SELECT path FROM files WHERE entry_id = ? ORDER BY path`, id)
 	rows, err := s.db.Query(`SELECT a.hash, a.ext, a.mime, a.bytes, ea.name, ea.caption, COALESCE(a.description, '')
 		FROM entry_assets ea JOIN assets a ON a.hash = ea.hash WHERE ea.entry_id = ?`, id)

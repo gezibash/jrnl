@@ -1489,7 +1489,7 @@ func TestServe(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(home) })
 	e.home = home
 	login := firstID(e.must("Users could not sign in after the token refresh.", "add", "--kind", "bug"))
-	e.must("Chose Go over Bun for the CLI.", "add", "--kind", "decision")
+	goBun := firstID(e.must("Chose Go over Bun for the CLI.", "add", "--kind", "decision"))
 
 	srv := exec.Command(bin, "serve")
 	srv.Env = append(os.Environ(), "JRNL_HOME="+home)
@@ -1548,6 +1548,23 @@ func TestServe(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, "nobody")); err == nil {
 		t.Errorf("serve created a journal for a project it was only asked about")
+	}
+
+	// A new decision like an earlier one: jrnl add names the earlier one and
+	// the command that marks it replaced, and links nothing itself.
+	out, errOut, err := e.run("", "add", "--kind", "decision", "Chose Go over Bun for the CLI again, after trying Bun's compile step")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again := firstID(out)
+	if !strings.Contains(errOut, "jrnl link "+again+" <ID> --supersedes") || !strings.Contains(errOut, goBun) {
+		t.Errorf("want the earlier decision suggested on stderr:\n%s", errOut)
+	}
+	if show := e.must("", "show", goBun); strings.Contains(show, "superseded_by") {
+		t.Errorf("a suggestion must not link by itself:\n%s", show)
+	}
+	if _, errOut, _ := e.run("", "add", "--kind", "note", "Chose Go over Bun for the CLI, a note"); strings.Contains(errOut, "earlier decisions") {
+		t.Errorf("only decisions get suggestions:\n%s", errOut)
 	}
 }
 
@@ -1796,7 +1813,7 @@ func TestServeContextFormat(t *testing.T) {
 	}
 
 	out := get("why did we drop cloudflare as the provider")
-	if d := entry(out, dropped); !strings.Contains(d, `<linked-from-later id="`+back+`"`) {
+	if d := entry(out, dropped); !strings.Contains(d, `<linked-from id="`+back+`"`) {
 		t.Errorf("the dropped decision should name the later one that links to it:\n%s", out)
 	}
 	if entry(out, back) == "" {
@@ -1824,11 +1841,99 @@ func TestServeContextFormat(t *testing.T) {
 	}
 
 	// Entries the agent already has are left out.
-	if out := get("rotate the staging database password", todo, "01M00000000000000000000000"); strings.Contains(out, todo) {
+	if out := get("rotate the staging database password", todo, "01M00000000000000000000000"); entry(out, todo) != "" {
 		t.Errorf("an excluded entry was given again:\n%s", out)
+	}
+
+	// A thread: the newer decision names the one it replaces, with the
+	// passage that holds its reason; the older one says what replaced it.
+	old := add("decision", "Moved the job queue to Redis\n\nWhy: the Postgres queue table locked under 200 writers.")
+	cur := add("decision", "Moved the job queue back to Postgres with SKIP LOCKED")
+	if err := s.Link(cur, old, "supersedes"); err != nil {
+		t.Fatal(err)
+	}
+	out = get("why did we move the job queue", old) // the newer one alone is found
+	if c := entry(out, cur); !strings.Contains(c, `<supersedes id="`+old+`"`) || !strings.Contains(c, "locked under 200 writers") {
+		t.Errorf("the newer decision should carry the one it replaces and its reason:\n%s", out)
+	}
+	out = get("why did we move the job queue", cur) // the older one alone is found
+	if o := entry(out, old); !strings.Contains(o, `superseded-by="`+cur+`"`) || !strings.Contains(o, `<superseded-by id="`+cur+`"`) {
+		t.Errorf("the older decision should say what replaced it:\n%s", out)
 	}
 
 	if out := get("what is the capital of portugal"); out != "" {
 		t.Errorf("an unrelated prompt should get nothing:\n%s", out)
+	}
+}
+
+// A decision can say which earlier one it replaces, at add time or later
+// with jrnl link; show gives both directions; a wrong link can be changed
+// or removed.
+func TestSupersedes(t *testing.T) {
+	e := newEnv(t)
+	dropped := firstID(e.must("Dropped Cloudflare as the AI provider", "add", "--kind", "decision"))
+	kept := firstID(e.must("Cloudflare kept as a provider type", "add", "--kind", "decision", "--supersedes", dropped[:12]))
+	if show := e.must("", "show", dropped); !strings.Contains(show, "superseded_by: ["+kept+"]") || strings.Contains(show, "linked_from") {
+		t.Errorf("the older decision should say what replaced it, and not as a plain link:\n%s", show)
+	}
+	if show := e.must("", "show", kept); !strings.Contains(show, "supersedes: ["+dropped+"]") {
+		t.Errorf("the newer decision should say what it replaces:\n%s", show)
+	}
+
+	a := firstID(e.must("Use Postgres for the ledger", "add", "--kind", "decision"))
+	b := firstID(e.must("Use SQLite for the ledger", "add", "--kind", "decision"))
+	e.must("", "link", b, a)
+	if show := e.must("", "show", a); !strings.Contains(show, "linked_from: ["+b+"]") {
+		t.Errorf("jrnl link should relate them:\n%s", show)
+	}
+	e.must("", "link", b, a, "--supersedes")
+	if show := e.must("", "show", a); !strings.Contains(show, "superseded_by: ["+b+"]") || strings.Contains(show, "linked_from") {
+		t.Errorf("--supersedes should change the link's type:\n%s", show)
+	}
+	e.must("", "link", a, b, "--rm") // either direction
+	if show := e.must("", "show", a); strings.Contains(show, b) {
+		t.Errorf("--rm should remove the link:\n%s", show)
+	}
+	if _, _, err := e.run("", "link", a, b, "--rm"); err == nil {
+		t.Error("removing a link that is not there should fail")
+	}
+	if _, _, err := e.run("", "link", a, a); err == nil {
+		t.Error("an entry linking to itself should fail")
+	}
+}
+
+// Journals from before typed links: a close note's link becomes closes,
+// known from closed_by; other links stay plain.
+func TestUpgradeTypesLinks(t *testing.T) {
+	e := newEnv(t)
+	todo := firstID(e.must("Rotate the staging password", "add", "--kind", "todo"))
+	other := firstID(e.must("Staging password policy", "add", "--link", todo))
+	e.must("", "close", todo, "--note", "Rotated on Monday")
+	db, err := sql.Open("sqlite", filepath.Join(e.home, "test", "journal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, q := range []string{`ALTER TABLE links DROP COLUMN type`, `PRAGMA user_version = 4`} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	e.must("", "list")
+	types := map[string]string{}
+	rows, err := db.Query(`SELECT src, type FROM links WHERE dst = ?`, todo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var src, typ string
+		rows.Scan(&src, &typ)
+		types[src] = typ
+	}
+	rows.Close()
+	note := e.must("", "show", todo)
+	closedBy := note[strings.Index(note, "closed_by: ")+len("closed_by: "):][:26]
+	if types[closedBy] != "closes" || types[other] != "relates" || len(types) != 2 {
+		t.Errorf("want the close note's link closes and the other relates, got %v", types)
 	}
 }

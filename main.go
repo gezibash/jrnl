@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,11 +27,15 @@ const usage = `jrnl — per-project journal
       --kind K                 decision | bug | idea | todo | log | milestone | note (default note)
       --tag T                  repeatable
       --link ID                related entry (ID prefix is enough), repeatable
+      --supersedes ID          an earlier entry this one replaces, such as an older decision; repeatable
       --file PATH              file the entry is about, repeatable
       --attach PATH[::CAPTION] image, video or audio, repeatable
       --at WHEN                when it happened (default now), e.g. yesterday
       --open                   track it as open until closed (todo entries start open)
   jrnl close ID… [--note TEXT] mark entries closed; the note is saved as an entry linked to them
+  jrnl link FROM TO            link two entries (FROM relates to TO), or change or remove the link
+      --supersedes             FROM replaces TO: TO is shown as superseded
+      --rm                     remove the link between them
   jrnl reopen ID…              mark entries open again
   jrnl show ID…                print entries as markdown (ID prefix is enough); also read, open
   jrnl list [filters]          newest first; --oldest for oldest first
@@ -83,7 +89,7 @@ func main() {
 	cmds := map[string]func([]string) error{
 		"add": cmdAdd, "show": cmdShow, "read": cmdShow, "open": cmdShow, "list": cmdList, "ls": cmdList, "search": cmdSearch,
 		"reindex": cmdReindex, "backup": cmdBackup, "where": cmdWhere,
-		"sessions": cmdSessions, "stats": cmdStats, "close": cmdClose, "reopen": cmdReopen,
+		"sessions": cmdSessions, "stats": cmdStats, "close": cmdClose, "reopen": cmdReopen, "link": cmdLink,
 		"summarize": cmdSummarize, "summarise": cmdSummarize, "doctor": cmdDoctor, "serve": cmdServe,
 	}
 	name := os.Args[1]
@@ -189,9 +195,10 @@ func cmdAdd(args []string) error {
 	kind := fs.String("kind", "note", "")
 	author := fs.String("author", defaultAuthor(), "")
 	session := fs.String("session", os.Getenv("CLAUDE_CODE_SESSION_ID"), "")
-	var tags, links, files, attach multi
+	var tags, links, supersedes, files, attach multi
 	fs.Var(&tags, "tag", "")
 	fs.Var(&links, "link", "")
+	fs.Var(&supersedes, "supersedes", "")
 	fs.Var(&files, "file", "")
 	fs.Var(&attach, "attach", "")
 	at := fs.String("at", "", "")
@@ -236,10 +243,15 @@ func cmdAdd(args []string) error {
 			return fmt.Errorf("--link: %w", err)
 		}
 	}
+	for i, l := range supersedes {
+		if supersedes[i], err = s.Resolve(l); err != nil {
+			return fmt.Errorf("--supersedes: %w", err)
+		}
+	}
 	e := Entry{
 		ID: newID(), TS: utc(ts), Project: g.project,
 		Session: *session, Author: *author, Kind: *kind, Branch: g.branch, Commit: g.commit,
-		Title: *title, Body: body, Tags: tags, Links: links, Files: files,
+		Title: *title, Body: body, Tags: tags, Links: links, Supersedes: supersedes, Files: files,
 	}
 	if *open_ || *kind == "todo" {
 		e.Status = "open"
@@ -269,11 +281,84 @@ func cmdAdd(args []string) error {
 	// Print the ID as soon as the entry is saved, so a later failure can't
 	// lead the caller to retry and create a duplicate.
 	fmt.Println(e.ID)
+	if e.Kind == "decision" && len(e.Supersedes) == 0 {
+		suggestSupersedes(e)
+	}
 	if ai, err := NewAI(); err != nil {
 		fmt.Fprintf(os.Stderr, "jrnl: saved without embedding (run `jrnl reindex` later): %v\n", err)
 	} else if _, err := process(s, ai, e.ID, true); err != nil {
 		return err
 	}
+	return nil
+}
+
+// suggestSupersedes lists earlier decisions like e, so the agent that wrote
+// it can say which one it replaces while it still knows. It asks a running
+// jrnl serve (a search there takes about a millisecond) and stays quiet
+// without one; it never links anything itself, since a wrong supersedes
+// link hides a decision that still holds.
+func suggestSupersedes(e Entry) {
+	q := e.Title + "\n" + e.Body
+	if len(q) > 500 {
+		q = q[:500]
+	}
+	v := url.Values{"project": {e.Project}, "q": {q}, "kind": {"decision"}, "limit": {"3"}, "exclude": {e.ID}}
+	r, err := socketClient(socketPath()).Get("http://jrnl/search?" + v.Encode())
+	if err != nil {
+		return
+	}
+	defer r.Body.Close()
+	b, _ := io.ReadAll(r.Body)
+	if r.StatusCode != http.StatusOK || strings.TrimSpace(string(b)) == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "jrnl: earlier decisions like this one. If it replaces one, run: jrnl link %s <ID> --supersedes\n%s",
+		e.ID, b)
+}
+
+func cmdLink(args []string) error {
+	fs, project := newFlags("link")
+	supersedes := fs.Bool("supersedes", false, "")
+	rm := fs.Bool("rm", false, "")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 2 {
+		return fmt.Errorf("link: give two entry IDs, FROM and TO")
+	}
+	s, _, err := open(*project)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	from, err := s.Resolve(pos[0])
+	if err != nil {
+		return err
+	}
+	to, err := s.Resolve(pos[1])
+	if err != nil {
+		return err
+	}
+	if *rm {
+		found, err := s.Unlink(from, to)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("link: %s and %s are not linked", from, to)
+		}
+		fmt.Printf("%s  unlinked  %s\n", from, to)
+		return nil
+	}
+	typ := "relates"
+	if *supersedes {
+		typ = "supersedes"
+	}
+	if err := s.Link(from, to, typ); err != nil {
+		return err
+	}
+	fmt.Printf("%s  %s  %s\n", from, typ, to)
 	return nil
 }
 
@@ -334,6 +419,8 @@ func printEntry(e Entry) {
 		}
 	}
 	list("tags", e.Tags)
+	list("supersedes", e.Supersedes)
+	list("superseded_by", e.SupersededBy)
 	list("links", e.Links)
 	list("linked_from", e.LinkedFrom)
 	files := make([]string, len(e.Files))
@@ -935,7 +1022,7 @@ func setStatus(project string, prefixes []string, status, note string) error {
 		ne := Entry{
 			ID: newID(), TS: utc(now()), Project: g.project, Session: os.Getenv("CLAUDE_CODE_SESSION_ID"),
 			Author: defaultAuthor(), Kind: "log", Branch: g.branch, Commit: g.commit,
-			Title: "Closed: " + truncate(strings.Join(titles, "; "), 70), Body: note, Links: ids,
+			Title: "Closed: " + truncate(strings.Join(titles, "; "), 70), Body: note, Closes: ids,
 		}
 		if err := s.Insert(ne, []Chunk{{Modality: "text"}}); err != nil {
 			return err
