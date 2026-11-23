@@ -494,6 +494,9 @@ func TestCloudOutageDoesNotBlockText(t *testing.T) {
 // One attachment the API rejects must not leave the rest of the entry
 // unsearchable, and reindex must not retry it forever.
 func TestRejectedAttachmentDoesNotBlockOthers(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("needs ffmpeg: without it the video waits instead of being rejected")
+	}
 	e := newEnv(t)
 	dir := t.TempDir()
 	img, vid, txt := filepath.Join(dir, "shot.png"), filepath.Join(dir, "clip.mp4"), filepath.Join(dir, "notes.txt")

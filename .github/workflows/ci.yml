@@ -7,6 +7,7 @@ on:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -15,6 +16,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # One test needs ffmpeg and skips without it; Linux runs it.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: go vet ./...
       # Tests that need the embedding model (128 MB) skip where it is not downloaded.
       - run: go test ./...
