@@ -1,1 +1,0 @@
-{ "name": "jrnl-recall", "version": "0.2.0", "description": "Searches this project's jrnl journal on each prompt and attaches what it finds as hidden background context for Claude." }

@@ -121,31 +121,12 @@ starts one.
 curl --unix-socket ~/.journal/.run/jrnl.sock 'http://jrnl/search?project=<name>&q=<words>&limit=5'
 ```
 
-Add `format=context` for a block written for a coding agent to read: each
-entry's whole title and its text (the passage that matches, when long), how it
-matched, when and at which commit it was written, and later entries that link
-to it, such as a newer decision; `exclude=ID,ID` leaves out entries the agent
-already has. A search takes about 9 ms on 20,000 entries (almost all of it embedding the question), so a hook
-can run one on every prompt. It shows only clear matches, and nothing for an unrelated
+`exclude=ID,ID` leaves entries out. A search takes about 9 ms on 20,000 entries (almost all of it embedding the question), so a hook
+can run one on every prompt. It prints what `jrnl search` prints, and shows only clear matches, and nothing for an unrelated
 question. The server runs one at a time, replaces a server of another version
 when started, frees a journal after 10 idle minutes and exits after 30.
 `jrnl search --fast` gives the same answer from the command line: every
 search ranks with the same code.
-
-## Recall in Claude Code
-
-The `jrnl-recall` mod searches the project's journal on each prompt and
-attaches what clearly matches as background for Claude, with nothing shown on
-screen. It starts `jrnl serve` itself and needs jrnl 3.3.0 or later. At the
-prompt of a terminal session:
-
-```
-/plugin install jrnl-recall --marketplace gezibash/jrnl
-```
-
-From a shell: `claude plugin install jrnl-recall --marketplace gezibash/jrnl`.
-In the desktop app: + next to the prompt box, then Plugins, Add marketplace
-with `gezibash/jrnl`, then Add plugin. Its source is in `mods/jrnl-recall`.
 
 ## Use
 
@@ -173,7 +154,7 @@ jrnl add --kind decision --supersedes 01M7WEN3 "Cloudflare kept as a provider ty
 jrnl link NEW OLD --supersedes   # afterwards; --rm removes a wrong link
 ```
 
-`show` and the agent recall block then mark the older entry as superseded and
+`show` then marks the older entry as superseded and keeps
 keep its text, since it often holds the reason. With `jrnl serve` running,
 `jrnl add --kind decision` lists similar earlier decisions and the command to
 link one; it never links by itself.
