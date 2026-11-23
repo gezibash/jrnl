@@ -24,7 +24,9 @@ const (
 // tokens each), ran out of its 4,000-token budget on a 1,512-entry week, and
 // garbled some IDs.
 const summaryRules = "Cover what was done, decisions and why, problems hit and how they were fixed, " +
-	"and what is still open. Group short markdown bullets under headings. End each bullet with the " +
+	"and what is still open. An entry marked closed or replaced is settled: report it as past, with how " +
+	"it ended, and never as the current state. Under what is still open, list only entries marked (open). " +
+	"Group short markdown bullets under headings. End each bullet with the " +
 	"numbers of up to 5 entries it comes from, like [12, 40]. Leave out nothing important and add " +
 	"nothing that isn't in the entries. No preamble."
 
@@ -90,7 +92,8 @@ func summarizeFilter(s *Store, ai *AI, g gitInfo, f Filter, refresh bool) (*Entr
 		return nil, err
 	}
 
-	// Reuse the saved summary unless an entry was added after it. IDs sort
+	// Reuse the saved summary unless an entry was added after it, or one of
+	// its entries was closed or replaced since: see coverage. IDs sort
 	// by creation time, so a newer ID means a newer entry, even one logged
 	// with --at for an earlier day.
 	newest := ""
@@ -105,7 +108,7 @@ func summarizeFilter(s *Store, ai *AI, g gitInfo, f Filter, refresh bool) (*Entr
 		if o.Title != key {
 			continue
 		}
-		if o.ID > newest && !refresh {
+		if o.ID > newest && !refresh && strings.HasSuffix(o.Body, coverage(entries)) {
 			return &o, nil
 		}
 		if err := s.Delete(o.ID); err != nil {
@@ -116,7 +119,7 @@ func summarizeFilter(s *Store, ai *AI, g gitInfo, f Filter, refresh bool) (*Entr
 	size := 0
 	var days []string
 	for n, e := range entries {
-		size += len(entryLine(n, e)) + 1
+		size += len(entryLine(s, n, e)) + 1
 		if d := localTime(e.TS)[:10]; len(days) == 0 || days[len(days)-1] != d {
 			days = append(days, d)
 		}
@@ -125,16 +128,15 @@ func summarizeFilter(s *Store, ai *AI, g gitInfo, f Filter, refresh bool) (*Entr
 	if len(days) > 1 && size > summaryPartChars {
 		body, err = summarizeByDay(s, ai, g, f, refresh, entries, days)
 	} else {
-		body, err = summarizeEntries(ai, entries)
+		body, err = summarizeEntries(s, ai, entries)
 	}
 	if err != nil {
 		return nil, err
 	}
-	first, last := localTime(entries[0].TS), localTime(entries[len(entries)-1].TS)
 	sum := Entry{
 		ID: newID(), TS: utc(now()), Project: g.project, Session: os.Getenv("CLAUDE_CODE_SESSION_ID"),
 		Author: defaultAuthor(), Kind: "summary", Branch: g.branch, Commit: g.commit, Tags: []string{"summary"},
-		Title: key, Body: fmt.Sprintf("%s\n\n_Covers %d entries, %s → %s._", body, len(entries), first, last),
+		Title: key, Body: body + "\n\n" + coverage(entries),
 	}
 	if err := s.Insert(sum, []Chunk{{Modality: "text"}}); err != nil {
 		return nil, err
@@ -283,11 +285,11 @@ func summaryKey(f Filter) (string, error) {
 
 // summarizeEntries sends the entries to Gemma, in parts if they are long,
 // and combines the part summaries into one.
-func summarizeEntries(ai *AI, entries []Entry) (string, error) {
+func summarizeEntries(s *Store, ai *AI, entries []Entry) (string, error) {
 	var parts []string
 	var cur strings.Builder
 	for n, e := range entries {
-		line := entryLine(n, e)
+		line := entryLine(s, n, e)
 		if cur.Len()+len(line) > summaryPartChars && cur.Len() > 0 {
 			parts = append(parts, cur.String())
 			cur.Reset()
@@ -371,12 +373,49 @@ func citeIDs(text string, entries []Entry) (string, int) {
 	return out, dropped
 }
 
+// coverage is a summary's last line: what it covers, and how many of those
+// entries are settled. A saved summary is reused only while this line still
+// holds, so one written before an entry was closed, reopened or replaced is
+// redone, whenever that happened.
+func coverage(entries []Entry) string {
+	var closed, replaced int
+	for _, e := range entries {
+		if e.Status == "closed" {
+			closed++
+		}
+		if len(e.SupersededBy) > 0 {
+			replaced++
+		}
+	}
+	settled := ""
+	if closed+replaced > 0 {
+		settled = fmt.Sprintf(" (%d closed, %d replaced since)", closed, replaced)
+	}
+	return fmt.Sprintf("_Covers %d entries%s, %s → %s._", len(entries), settled, localTime(entries[0].TS), localTime(entries[len(entries)-1].TS))
+}
+
 // entryLine is how an entry is shown to the summarizer: its number, time,
-// kind, status, text and attachment descriptions.
-func entryLine(n int, e Entry) string {
+// kind, status, text and attachment descriptions. A closed entry carries
+// when and how it was closed, and a replaced one what replaced it, also
+// when that happened after the period: the summary is read later.
+func entryLine(s *Store, n int, e Entry) string {
 	line := fmt.Sprintf("[%d] %s %s", n+1, localTime(e.TS), e.Kind)
-	if e.Status != "" {
+	if e.Status == "closed" {
+		line += " (closed"
+		if e.ClosedAt != "" {
+			line += " " + localTime(e.ClosedAt)[:10]
+		}
+		if by, err := s.Get(e.ClosedBy); err == nil && by.Body != "" {
+			line += ": " + truncate(oneLine(by.Body), 200)
+		}
+		line += ")"
+	} else if e.Status != "" {
 		line += " (" + e.Status + ")"
+	}
+	for _, id := range e.SupersededBy {
+		if by, err := s.Get(id); err == nil {
+			line += fmt.Sprintf(" (replaced %s by: %s)", localTime(by.TS)[:10], by.Title)
+		}
 	}
 	line += ": " + truncate(oneLine(e.Body), 600)
 	for _, a := range e.Assets {

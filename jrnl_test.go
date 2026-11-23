@@ -998,6 +998,56 @@ func TestUpgradeFromSchema1(t *testing.T) {
 	sameSet(t, "closed after upgrade", ids(e.must("", "list", "--status", "closed")), id)
 }
 
+// A summary is read later than its period: an entry closed or replaced
+// since must be shown to the summarizer as settled, with how it ended, and
+// a saved summary written before that must be redone. The test's clock
+// reads 2026-11-19.
+func TestSummarizeSeesWhatWasSettledLater(t *testing.T) {
+	e := newEnv(t)
+	todo := firstID(e.must("Login bug: users are logged out after a refresh.", "add", "--open", "--at", "2026-11-18T09:00:00+01:00"))
+	old := firstID(e.must("Sessions are kept in Redis.", "add", "--kind", "decision", "--at", "2026-11-18T10:00:00+01:00"))
+	newer := firstID(e.must("Sessions move to Postgres.", "add", "--kind", "decision"))
+	shown := func() string {
+		t.Helper()
+		e.must("", "summarize", "--on", "yesterday")
+		e.ai.mu.Lock()
+		defer e.ai.mu.Unlock()
+		b, _ := json.Marshal(e.ai.chatReqs[len(e.ai.chatReqs)-1])
+		_, entries, _ := strings.Cut(string(b), "Entries:") // after the instructions
+		return entries
+	}
+	if got := shown(); !strings.Contains(got, "(open)") || strings.Contains(got, "closed") || strings.Contains(got, "replaced") {
+		t.Fatalf("before anything is settled, the entries should be shown open and current:\n%s", got)
+	}
+
+	e.must("", "close", todo, "--note", "The refresh handler raced with the session writer; fixed.")
+	calls := e.ai.summaryCalls.Load()
+	got := shown()
+	if e.ai.summaryCalls.Load() == calls {
+		t.Fatal("a summary saved before an entry was closed should be redone")
+	}
+	if !strings.Contains(got, "(closed 2026-11-19: The refresh handler raced with the session writer; fixed.)") || strings.Contains(got, "(open)") {
+		t.Errorf("the closed entry should be shown with when and how it was closed:\n%s", got)
+	}
+
+	// Linked afterwards, from an entry older than the saved summary.
+	e.must("", "link", newer, old, "--supersedes")
+	calls = e.ai.summaryCalls.Load()
+	got = shown()
+	if e.ai.summaryCalls.Load() == calls {
+		t.Fatal("a summary saved before an entry was replaced should be redone")
+	}
+	if !strings.Contains(got, "(replaced 2026-11-19 by: Sessions move to Postgres.)") {
+		t.Errorf("the replaced decision should name what replaced it:\n%s", got)
+	}
+
+	calls = e.ai.summaryCalls.Load()
+	shown()
+	if n := e.ai.summaryCalls.Load() - calls; n != 0 {
+		t.Errorf("with nothing settled since, the saved summary should be reused, made %d calls", n)
+	}
+}
+
 // A summary covers exactly the period asked for, cites every entry so the
 // reader can open it, is saved and reused, and is redone when an entry is
 // added to the period later.
