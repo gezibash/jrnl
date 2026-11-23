@@ -12,9 +12,10 @@ package main
 //	  {"q": "why did logins fail after the deploy", "want": ["01M7…", "01M8…"]},
 //	  {"q": "kubernetes pod keeps restarting"}]}]
 //
-// want lists the entries that answer q, picked by reading titles and never
-// from search output; a question without want is unrelated, and nothing
-// should be shown for it. Journals keep growing, so a question can gain an
+// want lists the entries that answer q, picked by reading and never from
+// search output; a question without want is unrelated, and nothing should
+// be shown for it. at (RFC 3339) is when a real prompt was typed: entries
+// written later, often because of it, are left out of its search. Journals keep growing, so a question can gain an
 // answer: the output gives each journal's entry count, to quote beside any
 // figure. It needs the built-in embedding model, and skips without it.
 
@@ -34,6 +35,7 @@ type evalSet struct {
 	Questions     []struct {
 		Q    string
 		Want []string
+		At   string // when it was asked: only entries written before count
 	}
 }
 
@@ -92,14 +94,30 @@ func TestEval(t *testing.T) {
 		// (jrnl search before reranking). shown: through the gate, as
 		// jrnl serve and search --fast answer. leaks: negatives shown a hit.
 		// vectors: the wanted entry is the closest by meaning alone.
-		var pos, neg, first, top5, shown, leaks, vectors int
+		// entries, wanted: all entries shown, and those of them wanted.
+		var pos, neg, first, top5, shown, leaks, vectors, entries, wanted int
 		for _, e := range set.Questions {
 			v, err := ai.Embed([]Input{{Text: e.Q, Query: true}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			cands := idx.rank(e.Q, v[0], nil, "")
+			var only map[string]bool
+			if e.At != "" {
+				only = map[string]bool{}
+				for i, ts := range idx.ts {
+					if ts < e.At {
+						only[idx.ids[i]] = true
+					}
+				}
+			}
+			cands := idx.rank(e.Q, v[0], only, "")
 			kept := gateCut(slices.Clone(cands), true, g, 5)
+			entries += len(kept)
+			for _, k := range kept {
+				if slices.Contains(e.Want, k.id) {
+					wanted++
+				}
+			}
 			if len(e.Want) == 0 {
 				neg++
 				if len(kept) > 0 {
@@ -110,6 +128,11 @@ func TestEval(t *testing.T) {
 			}
 			pos++
 			sims, _ := idx.similarities(v[0])
+			for i := range sims {
+				if only != nil && !only[idx.ids[i]] {
+					sims[i] = 0
+				}
+			}
 			if best := topK(sims, 1); len(best) == 1 && slices.Contains(e.Want, idx.ids[best[0]]) {
 				vectors++
 			}
@@ -126,8 +149,8 @@ func TestEval(t *testing.T) {
 				t.Logf("miss: %q (ranked %d)", e.Q, at+1)
 			}
 		}
-		fmt.Printf("%-15s %s, %d entries: first %d/%d (by vectors alone %d), top five %d/%d | gated: shown %d/%d, unrelated shown %d/%d\n",
-			set.Name, set.Project, len(idx.ids), first, pos, vectors, top5, pos, shown, pos, leaks, neg)
+		fmt.Printf("%-15s %s, %d entries: first %d/%d (by vectors alone %d), top five %d/%d | gated: shown %d/%d, unrelated shown %d/%d, %d of %d entries shown wanted\n",
+			set.Name, set.Project, len(idx.ids), first, pos, vectors, top5, pos, shown, pos, leaks, neg, wanted, entries)
 		s.Close()
 	}
 }
