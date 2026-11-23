@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const usage = `jrnl — per-project journal
@@ -37,6 +38,7 @@ const usage = `jrnl — per-project journal
       --supersedes             FROM replaces TO: TO is shown as superseded
       --rm                     remove the link between them
   jrnl reopen ID…              mark entries open again
+  jrnl rm ID…                  delete entries for good, with their attachments and the summaries citing them
   jrnl show ID…                print entries as markdown (ID prefix is enough); also read, open
   jrnl list [filters]          newest first; --oldest for oldest first
   jrnl search [filters] QUERY  keyword + semantic search over entries and attachment descriptions
@@ -49,6 +51,7 @@ const usage = `jrnl — per-project journal
   jrnl summarize [filters]     summary of a period, citing entry IDs; saved and reused
       --refresh                write it again even if nothing changed
   jrnl reindex                 describe and embed whatever failed earlier
+      --prune                  also delete the vectors of embedding models no longer set up
   jrnl backup                  consistent copy of the database
   jrnl where                   print this project's journal directory
   jrnl doctor                  what is set up, and how to turn on the rest
@@ -89,7 +92,7 @@ func main() {
 	cmds := map[string]func([]string) error{
 		"add": cmdAdd, "show": cmdShow, "read": cmdShow, "open": cmdShow, "list": cmdList, "ls": cmdList, "search": cmdSearch,
 		"reindex": cmdReindex, "backup": cmdBackup, "where": cmdWhere,
-		"sessions": cmdSessions, "stats": cmdStats, "close": cmdClose, "reopen": cmdReopen, "link": cmdLink,
+		"sessions": cmdSessions, "stats": cmdStats, "close": cmdClose, "reopen": cmdReopen, "link": cmdLink, "rm": cmdRm,
 		"summarize": cmdSummarize, "summarise": cmdSummarize, "doctor": cmdDoctor, "serve": cmdServe,
 	}
 	name := os.Args[1]
@@ -179,15 +182,29 @@ func resolveFilter(s *Store, f *Filter) error {
 	return nil
 }
 
-func open(project string) (*Store, gitInfo, error) {
+// noJournal: the project has no journal yet. Only jrnl add starts one;
+// a command that reads must not leave an empty journal behind.
+type noJournal struct{ project string }
+
+func (n noJournal) Error() string {
+	return "no journal for " + n.project + " yet (`jrnl add` starts one)"
+}
+
+// open opens the project's journal. create is for jrnl add alone.
+func open(project string, create bool) (*Store, gitInfo, error) {
 	g := detectGit()
 	if project == "" {
 		project = g.project
 	}
-	s, err := Open(project)
 	g.project = project
+	if _, err := os.Stat(filepath.Join(journalHome(), project, "journal.db")); err != nil && !create {
+		return nil, g, noJournal{project}
+	}
+	s, err := Open(project)
 	return s, g, err
 }
+
+var kinds = []string{"decision", "bug", "idea", "todo", "log", "milestone", "note"}
 
 func cmdAdd(args []string) error {
 	fs, project := newFlags("add")
@@ -223,8 +240,17 @@ func cmdAdd(args []string) error {
 	if *title == "" {
 		*title = firstLine(body)
 	}
+	// A typo here would otherwise become a kind or tag of its own.
+	if !slices.Contains(kinds, *kind) {
+		return fmt.Errorf("--kind is one of %s, not %q", strings.Join(kinds, ", "), *kind)
+	}
+	for _, t := range tags {
+		if t == "" || strings.ContainsFunc(t, unicode.IsSpace) {
+			return fmt.Errorf("--tag is one word, not %q", t)
+		}
+	}
 
-	s, g, err := open(*project)
+	s, g, err := open(*project, true)
 	if err != nil {
 		return err
 	}
@@ -327,7 +353,7 @@ func cmdLink(args []string) error {
 	if len(pos) != 2 {
 		return fmt.Errorf("link: give two entry IDs, FROM and TO")
 	}
-	s, _, err := open(*project)
+	s, _, err := open(*project, false)
 	if err != nil {
 		return err
 	}
@@ -362,6 +388,50 @@ func cmdLink(args []string) error {
 	return nil
 }
 
+// cmdRm deletes entries for good: the way out when a secret, or something
+// wrong, was written down. Backups made earlier keep their copies.
+func cmdRm(args []string) error {
+	fs, project := newFlags("rm")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) == 0 {
+		return fmt.Errorf("rm: give at least one entry ID")
+	}
+	s, _, err := open(*project, false)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	var ids, titles []string
+	for _, p := range pos {
+		id, err := s.Resolve(p)
+		if err != nil {
+			return err
+		}
+		e, err := s.Get(id)
+		if err != nil {
+			return err
+		}
+		ids, titles = append(ids, id), append(titles, e.Title)
+	}
+	summaries, err := s.Remove(ids)
+	if err != nil {
+		return err
+	}
+	for i, id := range ids {
+		fmt.Printf("%s  removed  %s\n", id, titles[i])
+	}
+	if summaries > 0 {
+		fmt.Fprintf(os.Stderr, "jrnl: also removed %d saved summary(ies) that cited them; `jrnl summarize` writes them again\n", summaries)
+	}
+	if bs, _ := filepath.Glob(filepath.Join(s.dir, "backups", "*.db")); len(bs) > 0 {
+		fmt.Fprintf(os.Stderr, "jrnl: %d backup(s) in %s may still hold them\n", len(bs), filepath.Join(s.dir, "backups"))
+	}
+	return nil
+}
+
 func cmdShow(args []string) error {
 	fs, project := newFlags("show")
 	ids, err := parse(fs, args)
@@ -371,7 +441,7 @@ func cmdShow(args []string) error {
 	if len(ids) == 0 {
 		return fmt.Errorf("show: give at least one entry ID")
 	}
-	s, _, err := open(*project)
+	s, _, err := open(*project, false)
 	if err != nil {
 		return err
 	}
@@ -485,7 +555,7 @@ func cmdList(args []string) error {
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
-	s, _, err := open(*project)
+	s, _, err := open(*project, false)
 	if err != nil {
 		return err
 	}
@@ -509,7 +579,7 @@ func cmdSessions(args []string) error {
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
-	s, _, err := open(*project)
+	s, _, err := open(*project, false)
 	if err != nil {
 		return err
 	}
@@ -535,7 +605,7 @@ func cmdStats(args []string) error {
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
-	s, _, err := open(*project)
+	s, _, err := open(*project, false)
 	if err != nil {
 		return err
 	}
@@ -589,7 +659,7 @@ func cmdSearch(args []string) error {
 	case *oldest:
 		order = "oldest"
 	}
-	s, _, err := open(*project)
+	s, _, err := open(*project, false)
 	if err != nil {
 		return err
 	}
@@ -639,21 +709,38 @@ func cmdSearch(args []string) error {
 			fmt.Fprintf(os.Stderr, "jrnl: keyword search only: %v\n", aiErr)
 		}
 	}
+	// One ranking for every text search, the one jrnl serve answers from:
+	// the journal's words and vectors, read into memory (about 8 ms per
+	// 1,000 entries).
+	var cands []candidate
+	if *like != "" {
+		cands, err = nearest(qvec, s.chunkVecs(embedder, modalities, *f))
+	} else {
+		var idx *memIndex
+		var only map[string]bool
+		if idx, err = buildMemIndex(s, embedder); err == nil {
+			if only, err = s.allowed(*f); err == nil {
+				cands = idx.rank(q, qvec, only, order)
+			}
+		}
+	}
+	if err != nil {
+		return err
+	}
 	if *fast && *like == "" && order == "" {
 		g := gateFor(ai.embedModel)
 		if *minScore >= 0 {
 			g = gate{float32(*minScore), float32(*minScore)}
 		}
-		hits, err := fastSearch(s, q, qvec, s.chunkVecs(embedder, modalities, *f), *f, g, *limit)
-		if err != nil {
-			return err
-		}
-		printHits(os.Stdout, hits)
-		return nil
+		cands = gateCut(cands, qvec != nil, g, *limit)
 	}
-	hits, err := s.Search(q, qvec, embedder, modalities, *f, order)
+	hits, err := s.hits(cands, q)
 	if err != nil {
 		return err
+	}
+	if *fast && *like == "" && order == "" {
+		printHits(os.Stdout, hits)
+		return nil
 	}
 	if len(hits) == 0 && aiErr != nil && awaitingSetup(s, aiErr) {
 		fmt.Fprintln(os.Stderr, "jrnl: no keyword match; search by meaning is off (see `jrnl doctor`)")
@@ -710,10 +797,11 @@ func printHits(w io.Writer, hits []Hit) {
 
 func cmdReindex(args []string) error {
 	fs, project := newFlags("reindex")
+	prune := fs.Bool("prune", false, "")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
-	s, _, err := open(*project)
+	s, _, err := open(*project, false)
 	if err != nil {
 		return err
 	}
@@ -735,6 +823,18 @@ func cmdReindex(args []string) error {
 		fmt.Printf(", %d still pending (%v)", r.waiting, r.lastErr)
 	}
 	fmt.Println()
+	if *prune {
+		unused, err := s.Unused(ai.embedID, ai.mediaID)
+		if err != nil {
+			return err
+		}
+		if err := s.Prune(ai.embedID, ai.mediaID); err != nil {
+			return err
+		}
+		for _, u := range unused {
+			fmt.Printf("removed %d vector(s) from %s\n", u.N, u.Key)
+		}
+	}
 	return nil
 }
 
@@ -743,7 +843,7 @@ func cmdBackup(args []string) error {
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
-	s, _, err := open(*project)
+	s, _, err := open(*project, false)
 	if err != nil {
 		return err
 	}
@@ -968,14 +1068,6 @@ func rerank(ai *AI, q string, hits []Hit, k int) []Hit {
 	return out
 }
 
-func embed(ins []Input) ([][]float32, error) {
-	ai, err := NewAI()
-	if err != nil {
-		return nil, err
-	}
-	return ai.Embed(ins)
-}
-
 func cmdClose(args []string) error {
 	fs, project := newFlags("close")
 	note := fs.String("note", "", "")
@@ -1001,7 +1093,7 @@ func setStatus(project string, prefixes []string, status, note string) error {
 	if len(prefixes) == 0 {
 		return fmt.Errorf("give at least one entry ID")
 	}
-	s, g, err := open(project)
+	s, g, err := open(project, false)
 	if err != nil {
 		return err
 	}
@@ -1052,22 +1144,29 @@ func cmdDoctor(args []string) error {
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
-	s, _, err := open(*project)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	total, _, _, _, err := s.Stats(Filter{})
-	if err != nil {
-		return err
-	}
 	ai, err := NewAI()
 	if err != nil {
 		return err
 	}
-	waiting, err := s.Waiting(ai.embedID, ai.mediaID)
-	if err != nil {
+	// Works before the first entry too: it is how setup is checked.
+	s, g, err := open(*project, false)
+	var none noJournal
+	if err != nil && !errors.As(err, &none) {
 		return err
+	}
+	total, waiting := 0, 0
+	var unused []Count
+	if s != nil {
+		defer s.Close()
+		if unused, err = s.Unused(ai.embedID, ai.mediaID); err != nil {
+			return err
+		}
+		if total, _, _, _, err = s.Stats(Filter{}); err != nil {
+			return err
+		}
+		if waiting, err = s.Waiting(ai.embedID, ai.mediaID); err != nil {
+			return err
+		}
 	}
 	row := func(name string, on bool, what, howTo string) {
 		state := "on "
@@ -1083,11 +1182,17 @@ func cmdDoctor(args []string) error {
 			fmt.Printf("%-10s      %s %s\n", "", label, howTo)
 		}
 	}
-	fmt.Printf("journal    %s: %d entries", s.dir, total)
+	fmt.Printf("journal    %s: %d entries", filepath.Join(journalHome(), g.project), total)
+	if s == nil {
+		fmt.Print(" (`jrnl add` starts it)")
+	}
 	if waiting > 0 {
 		fmt.Printf(", %d item(s) waiting for `jrnl reindex`", waiting)
 	}
 	fmt.Println()
+	for _, u := range unused {
+		fmt.Printf("%-10s %d vector(s) from %s, which is not set up now; `jrnl reindex --prune` deletes them\n", "", u.N, u.Key)
+	}
 	row("basics", true, "add, list, show, keyword search, stats, close", "")
 
 	// where says which setting chose a role, when it wasn't a default.
@@ -1137,10 +1242,13 @@ func cmdDoctor(args []string) error {
 		}
 	}
 	row("parakeet", parakeetOn, "transcripts of audio and video", how)
-	running, ok := runningVersion(socketPath())
+	running, emb, ok := runningServer(socketPath())
 	how = "`jrnl serve --background`; jrnl add starts it when entries wait for the embedding model"
 	if ok {
 		how = "server " + running + " running at " + socketPath()
+		if running == version && emb != ai.embedID {
+			how += ", embedding with " + emb + " (started under other settings)"
+		}
 	}
 	row("serve", ok, "searches from memory in milliseconds, for coding-agent hooks", how)
 	if waiting > 0 {

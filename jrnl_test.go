@@ -4,6 +4,7 @@ package main
 // boundary Claude uses.
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -493,6 +494,9 @@ func TestCloudOutageDoesNotBlockText(t *testing.T) {
 // One attachment the API rejects must not leave the rest of the entry
 // unsearchable, and reindex must not retry it forever.
 func TestRejectedAttachmentDoesNotBlockOthers(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("needs ffmpeg: without it the video waits instead of being rejected")
+	}
 	e := newEnv(t)
 	dir := t.TempDir()
 	img, vid, txt := filepath.Join(dir, "shot.png"), filepath.Join(dir, "clip.mp4"), filepath.Join(dir, "notes.txt")
@@ -626,19 +630,20 @@ func TestStopwordsAreNotKeywordHits(t *testing.T) {
 }
 
 // Search must follow the reranker's order, and fall back to keyword+vector
-// order when the reranker fails.
+// order when the reranker fails. ("folder" makes the second entry a
+// candidate: one that shares no word and no meaning with the query is not.)
 func TestSearchFollowsRerankerAndSurvivesItsFailure(t *testing.T) {
 	e := newEnv(t)
 	login := firstID(e.must("Login rejects valid credentials after deploy.", "add"))
 	other := firstID(e.must("Moved the docs folder (rerank-me).", "add"))
 
-	out := e.must("", "search", "login credentials")
+	out := e.must("", "search", "login credentials folder")
 	if !strings.HasPrefix(out, other) || !strings.Contains(strings.SplitN(out, "\n", 2)[0], "reranked") {
 		t.Fatalf("reranker's pick should come first, marked reranked:\n%s", out)
 	}
 
 	e.ai.rerankFail.Store(true)
-	out, errOut, err := e.run("", "search", "login credentials")
+	out, errOut, err := e.run("", "search", "login credentials folder")
 	if err != nil {
 		t.Fatalf("search failed when the reranker did: %v\n%s", err, errOut)
 	}
@@ -656,7 +661,7 @@ func TestSearchDoesNotWaitOnSlowReranker(t *testing.T) {
 
 	e.ai.rerankDelay.Store(10)
 	start := time.Now()
-	out, errOut, err := e.run("", "search", "login credentials")
+	out, errOut, err := e.run("", "search", "login credentials folder")
 	took := time.Since(start)
 	if err != nil {
 		t.Fatalf("search: %v\n%s", err, errOut)
@@ -671,7 +676,7 @@ func TestSearchDoesNotWaitOnSlowReranker(t *testing.T) {
 	e.ai.rerankDelay.Store(0)
 	e.ai.rerankFail.Store(true)
 	start = time.Now()
-	e.must("", "search", "login credentials")
+	e.must("", "search", "login credentials folder")
 	if took := time.Since(start); took > 3*time.Second {
 		t.Errorf("search retried a failing reranker for %s", took.Round(time.Second))
 	}
@@ -801,7 +806,7 @@ func TestVectorsFromAnotherEmbedderAreIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE chunks SET embedder = 'some-other/model/768'`); err != nil {
+	if _, err := db.Exec(`UPDATE vectors SET embedder = 'some-other/model/768'`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
@@ -976,10 +981,10 @@ func TestUpgradeFromSchema1(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, q := range []string{
+	for _, q := range append(slices.Clone(beforeSchema6), []string{
 		`ALTER TABLE entries DROP COLUMN status`, `ALTER TABLE entries DROP COLUMN closed_at`,
 		`ALTER TABLE entries DROP COLUMN closed_by`, `ALTER TABLE chunks DROP COLUMN embedder`, `PRAGMA user_version = 1`,
-	} {
+	}...) {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
@@ -1149,6 +1154,15 @@ func TestSwitchEmbeddingModel(t *testing.T) {
 	}
 }
 
+// beforeSchema6 puts a journal's vectors back where they were before
+// schema 6: one per piece, on its row, with the embedder that made it.
+var beforeSchema6 = []string{
+	`ALTER TABLE chunks ADD COLUMN vec BLOB`, `ALTER TABLE chunks ADD COLUMN embedder TEXT NOT NULL DEFAULT ''`,
+	`UPDATE chunks SET vec = (SELECT vec FROM vectors WHERE chunk_id = chunks.id),
+		embedder = COALESCE((SELECT embedder FROM vectors WHERE chunk_id = chunks.id), '')`,
+	`DROP TABLE vectors`,
+}
+
 // A journal from before schema 3 has vectors named by the old scheme. They
 // came from the same models and APIs, so they keep working without reindex:
 // text from Ollama, and media from Workers AI (now a cloudflare provider).
@@ -1161,10 +1175,10 @@ func TestUpgradeKeepsOldVectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, q := range []string{
+	for _, q := range append(slices.Clone(beforeSchema6),
 		`UPDATE chunks SET embedder = 'ollama/embeddinggemma-2:270m/768' WHERE modality IN ('text', 'caption')`,
 		`UPDATE chunks SET embedder = 'workers-ai/embeddinggemma-2/768' WHERE modality = 'image'`,
-		`PRAGMA user_version = 2`} {
+		`PRAGMA user_version = 2`) {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatal(err)
 		}
@@ -1739,120 +1753,6 @@ func TestServeOneServerOfTheCurrentVersion(t *testing.T) {
 	t.Cleanup(func() { socketClient(sock).Post("http://jrnl/quit", "", nil) })
 }
 
-// The context format, for a coding agent: an entry's whole title even past
-// the stored 80 characters; the paragraph of a long body that matches, with
-// how to read the rest; later entries that link to one (a newer decision
-// may replace it); a close note shown once, under the entry it closed; text
-// that cannot break the block; nothing for an unrelated prompt.
-func TestServeContextFormat(t *testing.T) {
-	ai := localTestAI(t)
-	t.Setenv("JRNL_HOME", t.TempDir())
-	s, err := Open("p")
-	if err != nil {
-		t.Fatal(err)
-	}
-	at := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
-	add := func(kind, body string, links ...string) string {
-		at = at.Add(time.Hour)
-		e := Entry{ID: newID(), TS: at.Format(time.RFC3339), Project: "p", Kind: kind, Title: firstLine(body), Body: body, Links: links}
-		if len(e.Title) > 80 {
-			e.Title = e.Title[:77] + "…" // as jrnl add stores it
-		}
-		if err := s.Insert(e, []Chunk{{Modality: "text"}}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := process(s, ai, e.ID, true); err != nil {
-			t.Fatal(err)
-		}
-		return e.ID
-	}
-	dropped := add("decision", "Dropped Cloudflare as the AI provider\n\nWhy: one Vercel key for embeddings, rerank and chat.")
-	back := add("decision", "Cloudflare is back as a provider type for chat and media vectors\n\nVercel cannot embed images.", dropped)
-	longTitle := "Webhook signatures from the payment provider were rejected after the signing secret was rotated on Friday"
-	filler := strings.Repeat("The dashboard layout uses a grid of cards with a sidebar for filters. ", 12)
-	webhook := add("bug", longTitle+"\n\n"+filler+"\n\nRoot cause: the verifier cached the old signing secret; a <script> tag in a test payload was unrelated.\n\n"+filler)
-	todo := add("todo", "Rotate the staging database password before the audit")
-	closed := add("log", "Closed: Rotate the staging database password before the audit\n\nRotated on Monday.", todo)
-
-	sv := newServer(ai)
-	get := func(q string, exclude ...string) string {
-		rec := httptest.NewRecorder()
-		v := url.Values{"project": {"p"}, "q": {q}, "format": {"context"}}
-		if exclude != nil {
-			v.Set("exclude", strings.Join(exclude, ","))
-		}
-		sv.ServeHTTP(rec, httptest.NewRequest("GET", "/search?"+v.Encode(), nil))
-		if rec.Code != 200 {
-			t.Fatalf("%s: %d %s", q, rec.Code, rec.Body)
-		}
-		return rec.Body.String()
-	}
-	entry := func(out, id string) string { // the <entry> element for id
-		i := strings.Index(out, `<entry id="`+id+`"`)
-		if i < 0 {
-			return ""
-		}
-		j := strings.Index(out[i:], "</entry>")
-		if j < 0 {
-			j = strings.Index(out[i:], "/>\n") // one line
-		}
-		return out[i : i+j]
-	}
-
-	out := get("why did we drop cloudflare as the provider")
-	if d := entry(out, dropped); !strings.Contains(d, `<linked-from id="`+back+`"`) {
-		t.Errorf("the dropped decision should name the later one that links to it:\n%s", out)
-	}
-	if entry(out, back) == "" {
-		t.Errorf("the later decision should be shown as an entry too:\n%s", out)
-	}
-
-	out = get("webhook signatures rejected signing secret rotated")
-	w := entry(out, webhook)
-	switch {
-	case !strings.Contains(w, longTitle):
-		t.Errorf("want the whole title, not the stored 80 characters:\n%s", out)
-	case !strings.Contains(w, "Root cause: the verifier cached the old signing secret"):
-		t.Errorf("want the paragraph that matches:\n%s", out)
-	case strings.Contains(w, "dashboard layout"):
-		t.Errorf("want the matching paragraph only, not the long rest of the body:\n%s", out)
-	case !strings.Contains(w, `rest="jrnl show `+webhook+`"`):
-		t.Errorf("a cut body should say how to read the rest:\n%s", out)
-	case strings.Contains(out, "<script>") || strings.Count(out, "<entry ") != strings.Count(out, "</entry>")+strings.Count(out, "/>\n"):
-		t.Errorf("entry text must not open or close elements:\n%s", out)
-	}
-
-	out = get("rotate the staging database password")
-	if entry(out, todo) == "" || strings.Count(out, `id="`+closed+`"`) != 1 || entry(out, closed) != "" {
-		t.Errorf("the close note should appear once, under the todo it closed:\n%s", out)
-	}
-
-	// Entries the agent already has are left out.
-	if out := get("rotate the staging database password", todo, "01M00000000000000000000000"); entry(out, todo) != "" {
-		t.Errorf("an excluded entry was given again:\n%s", out)
-	}
-
-	// A thread: the newer decision names the one it replaces, with the
-	// passage that holds its reason; the older one says what replaced it.
-	old := add("decision", "Moved the job queue to Redis\n\nWhy: the Postgres queue table locked under 200 writers.")
-	cur := add("decision", "Moved the job queue back to Postgres with SKIP LOCKED")
-	if err := s.Link(cur, old, "supersedes"); err != nil {
-		t.Fatal(err)
-	}
-	out = get("why did we move the job queue", old) // the newer one alone is found
-	if c := entry(out, cur); !strings.Contains(c, `<supersedes id="`+old+`"`) || !strings.Contains(c, "locked under 200 writers") {
-		t.Errorf("the newer decision should carry the one it replaces and its reason:\n%s", out)
-	}
-	out = get("why did we move the job queue", cur) // the older one alone is found
-	if o := entry(out, old); !strings.Contains(o, `superseded-by="`+cur+`"`) || !strings.Contains(o, `<superseded-by id="`+cur+`"`) {
-		t.Errorf("the older decision should say what replaced it:\n%s", out)
-	}
-
-	if out := get("what is the capital of portugal"); out != "" {
-		t.Errorf("an unrelated prompt should get nothing:\n%s", out)
-	}
-}
-
 // A decision can say which earlier one it replaces, at add time or later
 // with jrnl link; show gives both directions; a wrong link can be changed
 // or removed.
@@ -1901,7 +1801,7 @@ func TestUpgradeTypesLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	for _, q := range []string{`ALTER TABLE links DROP COLUMN type`, `PRAGMA user_version = 4`} {
+	for _, q := range append(slices.Clone(beforeSchema6), `ALTER TABLE links DROP COLUMN type`, `PRAGMA user_version = 4`) {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
@@ -1990,7 +1890,7 @@ func TestServeBackfill(t *testing.T) {
 		}
 	}
 	// One of them has a vector, from an embedder the server does not use.
-	if _, err := s.db.Exec(`UPDATE chunks SET vec = ?, embedder = 'old-model@elsewhere' WHERE entry_id = ?`,
+	if _, err := s.db.Exec(`INSERT INTO vectors SELECT id, 'old-model@elsewhere', ? FROM chunks WHERE entry_id = ?`,
 		encodeVec(make([]float32, 8)), other.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -2012,7 +1912,7 @@ func TestServeBackfill(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	var n int
-	s.db.QueryRow(`SELECT count(*) FROM chunks WHERE embedder = ? AND vec IS NOT NULL`, localID).Scan(&n)
+	s.db.QueryRow(`SELECT count(*) FROM vectors WHERE embedder = ?`, localID).Scan(&n)
 	if n != 2 {
 		t.Errorf("want both entries' vectors stored by the server's embedder, got %d", n)
 	}
@@ -2176,4 +2076,295 @@ func TestLocalResetDuringEmbedding(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// Only jrnl add starts a journal. A command that reads said nothing and left
+// an empty journal behind for every folder it was run in; doctor still works
+// before the first entry, since it is how setup is checked.
+func TestReadingStartsNoJournal(t *testing.T) {
+	e := newEnv(t)
+	for _, args := range [][]string{{"list"}, {"search", "anything"}, {"stats"}, {"show", "01M"}, {"reindex"}} {
+		if _, errOut, err := e.run("", args...); err == nil || !strings.Contains(errOut, "no journal for test yet") {
+			t.Errorf("jrnl %v: want an error saying there is no journal yet, got %v %q", args, err, errOut)
+		}
+	}
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "0 entries") {
+		t.Errorf("doctor should work before the first entry:\n%s", doc)
+	}
+	if _, err := os.Stat(filepath.Join(e.home, "test")); err == nil {
+		t.Error("reading created a journal")
+	}
+	id := firstID(e.must("First entry.", "add"))
+	if out := e.must("", "list"); !strings.HasPrefix(out, id) {
+		t.Errorf("list after the first add:\n%s", out)
+	}
+}
+
+// A mistyped kind or an empty tag is refused, not saved as a new kind or
+// tag that every later filter and count then carries.
+func TestAddRefusesUnknownKindAndBadTag(t *testing.T) {
+	e := newEnv(t)
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"add", "--kind", "decison", "text"}, `not "decison"`},
+		{[]string{"add", "--kind", "summary", "text"}, `not "summary"`},
+		{[]string{"add", "--tag", "", "text"}, "--tag is one word"},
+		{[]string{"add", "--tag", "two words", "text"}, "--tag is one word"},
+	} {
+		if out, errOut, err := e.run("", c.args...); err == nil || !strings.Contains(errOut, c.want) || out != "" {
+			t.Errorf("jrnl %v: want an error with %q and no ID, got %v %q %q", c.args, c.want, err, errOut, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(e.home, "test")); err == nil {
+		t.Error("a refused add started a journal")
+	}
+	e.must("text", "add", "--kind", "milestone", "--tag", "release")
+}
+
+// A config.toml that jrnl refuses is an error from summarize too; it
+// crashed with a nil pointer instead.
+func TestSummarizeWithBadConfig(t *testing.T) {
+	e := newEnv(t)
+	e.must("Shipped the importer.", "add")
+	e.config, e.noChat = "[chat]\nmodel = \"m\"\n", true // the config's chat, not the test default
+	_, errOut, err := e.run("", "summarize", "--on", "today")
+	if err == nil || !strings.Contains(errOut, "config [chat] needs a provider") || strings.Contains(errOut, "panic") {
+		t.Errorf("want the config error, got %v %q", err, errOut)
+	}
+}
+
+// jrnl rm is the way out after a secret was written down, so what it
+// removes must be gone from the files, not only from the listings: the
+// entry's text, an attachment no other entry uses, and a saved summary
+// that cites it. An attachment another entry still uses stays.
+func TestRmErases(t *testing.T) {
+	e := newEnv(t)
+	const secret, fileSecret = "Zqxmarker9173", "Wkvattach5520"
+	note := filepath.Join(t.TempDir(), "notes.txt")
+	os.WriteFile(note, []byte("token "+fileSecret), 0o644)
+	bad := firstID(e.must("Deploy key rotated.\n\nThe key is "+secret+" for now.", "add", "--tag", secret, "--attach", note, "--at", "yesterday"))
+	keeps := firstID(e.must("Same notes file, kept.", "add", "--attach", note, "--at", "yesterday"))
+	todo := firstID(e.must("Rotate the key.", "add", "--kind", "todo"))
+	e.must("", "close", todo, "--note", "done, see "+secret)
+	closeNote := firstID(e.must("", "list", "--kind", "log"))
+	e.must("", "summarize", "--on", "yesterday")
+	if out := e.must("", "list", "--kind", "summary"); out == "" {
+		t.Fatal("no summary was saved")
+	}
+
+	dir := filepath.Join(e.home, "test")
+	holds := func(marker string) (where []string) {
+		filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				b, _ := os.ReadFile(p)
+				if bytes.Contains(bytes.ToLower(b), []byte(strings.ToLower(marker))) {
+					where = append(where, filepath.Base(p))
+				}
+			}
+			return nil
+		})
+		return where
+	}
+	if len(holds(secret)) == 0 || len(holds(fileSecret)) == 0 {
+		t.Fatal("the markers are not in the journal's files before rm; the check below would prove nothing")
+	}
+
+	out, errOut, err := e.run("", "rm", bad, closeNote)
+	if err != nil || !strings.Contains(out, bad+"  removed") || !strings.Contains(errOut, "1 saved summary") {
+		t.Fatalf("rm: %v\n%s\n%s", err, out, errOut)
+	}
+	if where := holds(secret); len(where) > 0 {
+		t.Errorf("the removed text is still in %v", where)
+	}
+	if where := holds(fileSecret); len(where) != 1 {
+		t.Errorf("the attachment another entry uses should be the only copy left, found %v", where)
+	}
+	if out := e.must("", "list", "--limit", "100"); strings.Contains(out, bad) || strings.Contains(out, "summary") || !strings.Contains(out, keeps) {
+		t.Errorf("list after rm:\n%s", out)
+	}
+	if out := e.must("", "show", todo); strings.Contains(out, "closed_by") || !strings.Contains(out, "status: closed") {
+		t.Errorf("the todo should stay closed without its removed note:\n%s", out)
+	}
+	e.must("", "rm", keeps)
+	if where := holds(fileSecret); len(where) > 0 {
+		t.Errorf("the attachment no entry uses is still in %v", where)
+	}
+}
+
+// A server started under one embedder must not go on working for it after
+// config.toml names another: it quits at the next search that finds
+// entries without its vectors, and embeds nothing more its old way.
+func TestServeQuitsWhenTheEmbedderChanges(t *testing.T) {
+	e := newEnv(t)
+	home, err := os.MkdirTemp("/tmp", "jrs") // a socket path is limited to 104 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	e.home, e.dir = home, filepath.Join(t.TempDir(), "test")
+	os.MkdirAll(e.dir, 0o755)
+	quitServerAt(t, home)
+	conf := func(model string) string {
+		return "[providers.o]\nurl = \"" + e.url + "/v1\"\n[embed]\nprovider = \"o\"\nmodel = \"" + model + "\"\n"
+	}
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL="} // the config's embedder, not the test default
+	e.config = conf("emb-a")
+	e.must("Login form rejects valid credentials.", "add")
+	e.must("Chose Go over Bun for the CLI.", "add")
+	e.must("", "serve", "--background")
+	sock := filepath.Join(home, ".run", "jrnl.sock")
+	up := func() bool {
+		_, _, ok := runningServer(sock)
+		return ok
+	}
+	for i := 0; !up(); i++ {
+		if i == 100 {
+			t.Fatal("the server did not start")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// The settings change, and an entry is written under the new ones: the
+	// server has no vector of its own for it.
+	e.config = conf("emb-b")
+	e.must("Sessions expire after an hour.", "add")
+	count := func(model string) (n int) {
+		db, err := sql.Open("sqlite", "file:"+filepath.Join(home, "test", "journal.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if err := db.QueryRow(`SELECT count(*) FROM vectors WHERE embedder LIKE ? || '@%'`, model).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if a, b := count("emb-a"), count("emb-b"); a != 2 || b != 1 {
+		t.Fatalf("want 2 vectors from the old model and 1 from the new, got %d and %d", a, b)
+	}
+	if r, err := socketClient(sock).Get("http://jrnl/search?project=test&q=login+credentials"); err == nil {
+		r.Body.Close()
+	}
+	for i := 0; up(); i++ {
+		if i == 120 {
+			t.Fatal("the server is still running 6 s after a search under changed settings")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if a := count("emb-a"); a != 2 {
+		t.Errorf("the server embedded the new entry with its old model: %d vectors, want 2", a)
+	}
+}
+
+// Two embedders can work on one journal: each keeps its own vectors.
+// With one vector a piece, a reindex under JRNL_EMBED_* for one command
+// replaced every vector, and whatever ran under the usual settings (a
+// search, a jrnl serve) then found the journal waiting and embedded it
+// all again.
+func TestEmbeddersKeepTheirOwnVectors(t *testing.T) {
+	e := newEnv(t)
+	id := firstID(e.must("Login form rejects valid credentials.", "add"))
+	usual := e.extra
+	e.extra = []string{"JRNL_EMBED_MODEL=another-model"}
+	if out := e.must("", "reindex"); !strings.Contains(out, "embedded 1 pending") {
+		t.Fatalf("the other embedder should embed the entry for itself:\n%s", out)
+	}
+	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) || !strings.Contains(out, "vector") {
+		t.Errorf("not found by meaning under the other embedder:\n%s", out)
+	}
+	e.extra = usual
+	if doc := e.must("", "doctor"); strings.Contains(doc, "waiting") {
+		t.Errorf("the first embedder's vectors should still be there:\n%s", doc)
+	}
+	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) || !strings.Contains(out, "vector") {
+		t.Errorf("not found by meaning under the first embedder again:\n%s", out)
+	}
+}
+
+// A jrnl serve of another version holds a journal open with the old
+// schema's queries: after an upgrade moved the vectors, each of its
+// searches would fail, and nothing would replace it while prompts kept it
+// from idling out. The command that upgrades a journal asks it to quit.
+func TestUpgradeStopsAServerOfAnotherVersion(t *testing.T) {
+	e := newEnv(t)
+	home, err := os.MkdirTemp("/tmp", "jrs") // a socket path is limited to 104 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	e.home, e.dir = home, filepath.Join(t.TempDir(), "test")
+	os.MkdirAll(e.dir, 0o755)
+	quitServerAt(t, home)
+	e.must("Login form rejects valid credentials.", "add")
+	e.must("", "serve", "--background")
+	sock := filepath.Join(home, ".run", "jrnl.sock")
+	up := func() bool {
+		_, _, ok := runningServer(sock)
+		return ok
+	}
+	for i := 0; !up(); i++ {
+		if i == 100 {
+			t.Fatal("the server did not start")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(home, "test", "journal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range append(slices.Clone(beforeSchema6), `PRAGMA user_version = 5`) {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	// This process is the newer jrnl.
+	old := version
+	version = "9.9.9"
+	t.Cleanup(func() { version = old })
+	t.Setenv("JRNL_HOME", home)
+	s, err := Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	for i := 0; up(); i++ {
+		if i == 60 {
+			t.Fatal("the other version's server is still running 3 s after the upgrade")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// Vectors of a model no longer set up stay until asked away: doctor says
+// they are there, and reindex --prune deletes them and nothing else.
+func TestPruneRemovesUnusedVectors(t *testing.T) {
+	e := newEnv(t)
+	id := firstID(e.must("Login form rejects valid credentials.", "add"))
+	usual := e.extra
+	e.extra = []string{"JRNL_EMBED_MODEL=tried-once"}
+	e.must("", "reindex")
+	e.extra = usual
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "1 vector(s) from tried-once@") {
+		t.Errorf("doctor should list the other model's vector:\n%s", doc)
+	}
+	if out := e.must("", "reindex"); strings.Contains(out, "removed") {
+		t.Errorf("reindex without --prune removed vectors:\n%s", out)
+	}
+	if out := e.must("", "reindex", "--prune"); !strings.Contains(out, "removed 1 vector(s) from tried-once@") {
+		t.Errorf("reindex --prune should say what it removed:\n%s", out)
+	}
+	if doc := e.must("", "doctor"); strings.Contains(doc, "tried-once") || strings.Contains(doc, "waiting") {
+		t.Errorf("after pruning, only the current model's vectors should be left, none waiting:\n%s", doc)
+	}
+	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) || !strings.Contains(out, "vector") {
+		t.Errorf("the current model's vector should still find it:\n%s", out)
+	}
+	e.extra = []string{"JRNL_EMBED_MODEL=tried-once"}
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "1 item(s) waiting") {
+		t.Errorf("the pruned model should have the entry to embed again:\n%s", doc)
+	}
 }

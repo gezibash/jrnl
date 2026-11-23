@@ -95,43 +95,19 @@ mounted as a local `.env` file, so keys never sit on disk.
 `jrnl doctor` shows which parts are on, which models they use, where each was
 set, and how to turn on the rest. After turning one on, or switching
 embedding model, `jrnl reindex` indexes everything saved before. Vectors from
-different embedding models are never compared.
+different embedding models are never compared, and each model's are kept, so
+switching back needs no second reindex; `jrnl reindex --prune` deletes those
+of models no longer set up, which `jrnl doctor` lists.
 
-Measured on the same 20,000 entries and 30 reworded questions:
-
-| Embeddings + reranker | Right entry first | Median / slowest 5% | Notes |
-|---|---|---|---|
-| EmbeddingGemma 2 (local) + Gemma 4 (Workers AI) | 22 of 30 | 0.8 s / 4.2 s | |
-| EmbeddingGemma 2 (local) + Voyage rerank-3-lite | 22 of 30 | 0.56 s / 0.73 s | fastest |
-| Qwen3-Embedding-4B (local) + Gemma 4 | 24 of 30 | 0.93 s / 1.8 s | 8.8 GB of memory in Ollama |
-| Qwen3-Embedding-4B (Vercel) + Voyage rerank-3-lite | 25 of 30 | 1.3 s / 2.2 s | best answers |
-
-Cohere Rerank 5 Pro and Fast and Voyage rerank-3 scored 20 to 22, like Gemma:
-for most of the misses, the right entry was never among the candidates, so
-better embeddings help more than a better reranker.
-
-The numbers below were measured with EmbeddingGemma 2 and Gemma 4. Other
-models will score differently; the reranking and summary prompts were tuned
-on Gemma 4. Keep thinking short or off: a model that reasons at length can
-use up its reply budget and return nothing.
-
-Measured on 20,000 entries spread over 3 months, with 30 test questions:
-
-| | Keywords only | With Ollama and Workers AI |
-|---|---|---|
-| Question with the entry's own words: right entry first | 30 of 30 | 30 of 30 |
-| Question in other words: right entry first | 8 of 30 | 21 of 30 |
-| Search time, median / slowest 5% | 0.06 s / 0.07 s | 1.1 s / 4.2 s |
-| Adds per second, 16 sessions at once | 156 | 58 |
-
-The reworded questions avoid the entry's words on purpose, so they are the
-hard case. Search by meaning is what closes that gap.
-
-The built-in model was measured on a real 113-entry journal instead, with 27
-reworded questions and 18 unrelated ones: by its vectors alone it puts the
-right entry first for 24 of 27, as EmbeddingGemma through Ollama does (potion-base-32M:
-18), and through `jrnl serve` it shows the answer for 25 of 27 while 2 of the
-18 unrelated questions get a hit.
+On a real 159-entry journal (2026-11-22), with 27 reworded questions and 18
+unrelated ones, `jrnl serve` with the built-in model shows the answer for 25
+of the 27, and 3 of the 18 unrelated questions get a hit. Questions of two to
+four words do worse: 15 of 22 answered, 3 of 10 unrelated ones get a hit. By
+its vectors alone the model puts the right entry first for 22 of the 27; when
+the journal had 113 entries it was 24, as for EmbeddingGemma through Ollama
+(potion-base-32M: 18). `eval_test.go` measures it, from questions kept
+outside the repository; [docs/benchmarks.md](docs/benchmarks.md) has the
+figures for other embedding models and rerankers on 20,000 entries.
 
 ## Search from a coding-agent hook
 
@@ -145,15 +121,12 @@ starts one.
 curl --unix-socket ~/.journal/.run/jrnl.sock 'http://jrnl/search?project=<name>&q=<words>&limit=5'
 ```
 
-Add `format=context` for a block written for a coding agent to read: each
-entry's whole title and its text (the passage that matches, when long), how it
-matched, when and at which commit it was written, and later entries that link
-to it, such as a newer decision; `exclude=ID,ID` leaves out entries the agent
-already has. A search takes about 9 ms on 20,000 entries (almost all of it embedding the question), so a hook
-can run one on every prompt. It shows only clear matches, and nothing for an unrelated
+`exclude=ID,ID` leaves entries out. A search takes about 9 ms on 20,000 entries (almost all of it embedding the question), so a hook
+can run one on every prompt. It prints what `jrnl search` prints, and shows only clear matches, and nothing for an unrelated
 question. The server runs one at a time, replaces a server of another version
 when started, frees a journal after 10 idle minutes and exits after 30.
-`jrnl search --fast` gives the same kind of answer from the command line.
+`jrnl search --fast` gives the same answer from the command line: every
+search ranks with the same code.
 
 ## Use
 
@@ -165,8 +138,13 @@ jrnl search "users logged out"
 jrnl list --on yesterday
 jrnl list --status open --on "last week"
 jrnl summarize --on "last week"
+jrnl rm 01M7WEN3        # delete an entry for good, with its attachments
 jrnl help
 ```
+
+Only `jrnl add` starts a journal; the other commands say so when a project
+has none. `jrnl rm` rewrites the database, so the removed text is gone from
+the file; backups made earlier keep their copies.
 
 A newer decision can say which one it replaces, so the decisions on a topic read
 as a thread whose newest entry is the current state:
@@ -176,7 +154,7 @@ jrnl add --kind decision --supersedes 01M7WEN3 "Cloudflare kept as a provider ty
 jrnl link NEW OLD --supersedes   # afterwards; --rm removes a wrong link
 ```
 
-`show` and the agent recall block then mark the older entry as superseded and
+`show` then marks the older entry as superseded and keeps
 keep its text, since it often holds the reason. With `jrnl serve` running,
 `jrnl add --kind decision` lists similar earlier decisions and the command to
 link one; it never links by itself.

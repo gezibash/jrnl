@@ -40,7 +40,7 @@ func cmdSummarize(args []string) error {
 	if f.Since == "" && f.Until == "" && f.On == "" && f.Session == "" {
 		return fmt.Errorf(`summarize: say which period, e.g. --on "last week", --since monday or --session last`)
 	}
-	s, g, err := open(*project)
+	s, g, err := open(*project, false)
 	if err != nil {
 		return err
 	}
@@ -48,7 +48,10 @@ func cmdSummarize(args []string) error {
 	if err := resolveFilter(s, f); err != nil {
 		return err
 	}
-	ai, _ := NewAI()
+	ai, err := NewAI()
+	if err != nil {
+		return err
+	}
 	sum, err := summarizeFilter(s, ai, g, *f, *refresh)
 	if errors.Is(err, errNoChat) {
 		return fmt.Errorf("summaries need a chat model, which is not set up (see `jrnl doctor`); `jrnl list` with the same filters shows the entries")

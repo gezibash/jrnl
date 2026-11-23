@@ -17,6 +17,7 @@ import (
 // this takes about 1 ms.
 type memIndex struct {
 	ids      []string
+	ts       []string // when each entry happened, for --newest and --oldest
 	postings map[string][]posting
 	docLen   []int32
 	norm     []float32 // BM25's length factor per entry: k1*(1-b+b*len/avg)
@@ -32,7 +33,8 @@ type memIndex struct {
 	vecs     []int8
 	scale    []float32
 	vecDoc   []int32
-	has      []bool // entry has a vector; one without waits for backfill
+	vecHash  []string // the attachment a caption's vector describes; "" for the entry's text
+	has      []bool   // entry has a vector; one without waits for backfill
 }
 
 const bm25k1, bm25b = 1.2, 0.75
@@ -56,21 +58,21 @@ func buildMemIndex(s *Store, embedder string) (*memIndex, error) {
 
 // addSince adds the keyword rows written after the last one indexed.
 func (m *memIndex) addSince(s *Store) error {
-	rows, err := s.db.Query(`SELECT rowid, entry_id, title, body, tags, captions,
-		length(entry_id)+length(title)+length(body)+length(tags)+length(captions)
-		FROM entries_fts WHERE rowid > ? ORDER BY rowid`, m.maxRowid)
+	rows, err := s.db.Query(`SELECT f.rowid, f.entry_id, f.title, f.body, f.tags, f.captions,
+		length(f.entry_id)+length(f.title)+length(f.body)+length(f.tags)+length(f.captions), e.ts
+		FROM entries_fts f JOIN entries e ON e.id = f.entry_id WHERE f.rowid > ? ORDER BY f.rowid`, m.maxRowid)
 	if err != nil {
 		return err
 	}
-	var ids, texts []string
+	var ids, texts, tss []string
 	for rows.Next() {
-		var id, title, body, tags, captions string
+		var id, title, body, tags, captions, ts string
 		var n int64
-		if err := rows.Scan(&m.maxRowid, &id, &title, &body, &tags, &captions, &n); err != nil {
+		if err := rows.Scan(&m.maxRowid, &id, &title, &body, &tags, &captions, &n, &ts); err != nil {
 			rows.Close()
 			return err
 		}
-		ids = append(ids, id)
+		ids, tss = append(ids, id), append(tss, ts)
 		texts = append(texts, strings.Join([]string{title, body, tags, captions}, "\n"))
 		m.textLen += n
 	}
@@ -86,6 +88,7 @@ func (m *memIndex) addSince(s *Store) error {
 	for i, d := range docs {
 		doc := int32(len(m.ids))
 		m.ids = append(m.ids, ids[i])
+		m.ts = append(m.ts, tss[i])
 		m.has = append(m.has, false)
 		for j, t := range d.terms {
 			m.postings[t] = append(m.postings[t], posting{doc, d.tf[j]})
@@ -112,17 +115,17 @@ func (m *memIndex) loadVecs(s *Store) error {
 	if len(want) == 0 {
 		return nil
 	}
-	rows, err := s.db.Query(`SELECT entry_id, vec FROM chunks
-		WHERE embedder = ? AND vec IS NOT NULL AND modality IN ('text', 'caption') ORDER BY id`, m.embedder)
+	rows, err := s.db.Query(`SELECT c.entry_id, c.hash, v.vec FROM vectors v JOIN chunks c ON c.id = v.chunk_id
+		WHERE v.embedder = ? AND c.modality IN ('text', 'caption') ORDER BY c.id`, m.embedder)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	found := map[int32]bool{}
 	for rows.Next() {
-		var id string
+		var id, hash string
 		var blob []byte
-		if err := rows.Scan(&id, &blob); err != nil {
+		if err := rows.Scan(&id, &hash, &blob); err != nil {
 			return err
 		}
 		doc, ok := want[id]
@@ -138,6 +141,7 @@ func (m *memIndex) loadVecs(s *Store) error {
 		}
 		m.vecs, m.scale = appendInt8(m.vecs, m.scale, v)
 		m.vecDoc = append(m.vecDoc, doc)
+		m.vecHash = append(m.vecHash, hash)
 		found[doc] = true
 	}
 	for doc := range found {
@@ -242,30 +246,6 @@ func eachTerm(text string, fn func(string)) {
 	}
 }
 
-// stem strips common English suffixes, so "refreshed", "refreshes" and
-// "refreshing" meet "refresh". Rougher than FTS5's Porter stemmer, and
-// applied the same way to entries and queries.
-func stem(w string) string {
-	if len(w) <= 3 {
-		return w
-	}
-	switch {
-	case strings.HasSuffix(w, "ies") && len(w) > 4:
-		return w[:len(w)-3] + "y"
-	case strings.HasSuffix(w, "sses"):
-		return w[:len(w)-2]
-	case strings.HasSuffix(w, "ing") && len(w) > 5:
-		return w[:len(w)-3]
-	case strings.HasSuffix(w, "ed") && len(w) > 4:
-		return w[:len(w)-2]
-	case strings.HasSuffix(w, "es") && len(w) > 4 && !strings.HasSuffix(w, "ses"):
-		return w[:len(w)-2]
-	case strings.HasSuffix(w, "s") && !strings.HasSuffix(w, "ss") && !strings.HasSuffix(w, "us"):
-		return w[:len(w)-1]
-	}
-	return w
-}
-
 // queryTerms are the distinct terms of q, without stopwords.
 func queryTerms(q string) []string {
 	var terms []string
@@ -297,8 +277,16 @@ func queryTerms(q string) []string {
 	return terms
 }
 
-// rank fuses BM25 and vector ranks as Store.rank does, from memory.
-func (m *memIndex) rank(q string, qvec []float32) []candidate {
+// rank fuses BM25 keyword ranks with vector ranks (reciprocal rank fusion)
+// and returns every candidate, best first, without loading any entry.
+// qvec may be nil: then only keywords are used. only, when not nil, holds
+// the entries a filter allows.
+//
+// order "newest" or "oldest" is for "the latest on X" and "when did X first
+// happen": keyword candidates are then taken in date order, with all terms
+// required if any entry has them all. On the 20,000-entry test, relevance
+// order put the newest of 351 "Redis cluster" entries nowhere in the top 5.
+func (m *memIndex) rank(q string, qvec []float32, only map[string]bool, order string) []candidate {
 	byDoc := map[int32]*candidate{}
 	get := func(doc int32) *candidate {
 		c := byDoc[doc]
@@ -308,6 +296,7 @@ func (m *memIndex) rank(q string, qvec []float32) []candidate {
 		}
 		return c
 	}
+	allowed := func(doc int) bool { return only == nil || only[m.ids[doc]] }
 
 	terms := queryTerms(q)
 	if len(terms) > 0 && len(m.ids) > 0 {
@@ -322,12 +311,20 @@ func (m *memIndex) rank(q string, qvec []float32) []candidate {
 			idf := float32(math.Log((n-float64(len(ps))+0.5)/(float64(len(ps))+0.5) + 1))
 			w := idf * (bm25k1 + 1)
 			for _, p := range ps {
+				if !allowed(int(p.doc)) {
+					continue
+				}
 				tf := float32(p.tf)
 				scores[p.doc] += w * tf / (tf + m.norm[p.doc])
 				matched[p.doc]++
 			}
 		}
-		top := topK(scores, kwCandidates)
+		var top []int32
+		if order == "" {
+			top = topK(scores, kwCandidates)
+		} else {
+			top = m.byDate(matched, len(terms), order == "oldest")
+		}
 		for rank, doc := range top {
 			c := get(doc)
 			c.score += 1.0 / float64(rrfK+rank+1)
@@ -342,19 +339,27 @@ func (m *memIndex) rank(q string, qvec []float32) []candidate {
 			}
 		}
 		for _, doc := range top {
-			if rare && int(matched[doc]) == len(terms) {
+			if rare && order == "" && int(matched[doc]) == len(terms) {
 				get(doc).allTerms = true
 			}
 		}
 	}
 
 	if qvec != nil && len(m.ids) > 0 && len(qvec) == m.dim {
-		sims := m.similarities(qvec)
+		sims, rows := m.similarities(qvec)
+		for doc := range sims {
+			if !allowed(doc) {
+				sims[doc] = 0
+			}
+		}
 		for rank, doc := range topK(sims, vecCandidates) {
 			c := get(doc)
 			c.score += 1.0 / float64(rrfK+rank+1)
 			c.via = append(c.via, "vector")
 			c.match = "text"
+			if h := m.vecHash[rows[doc]]; h != "" {
+				c.match = "caption:" + h
+			}
 			c.sim = sims[doc]
 		}
 	}
@@ -367,18 +372,44 @@ func (m *memIndex) rank(q string, qvec []float32) []candidate {
 		if cands[i].score != cands[j].score {
 			return cands[i].score > cands[j].score
 		}
-		return cands[i].id > cands[j].id
+		return cands[i].id > cands[j].id // newer first on ties
 	})
 	return cands
 }
 
-// similarities is each entry's best cosine with q over its vectors, the
-// dot products split across the cores: 20,000 x 384 is 8 million
-// multiplications.
-func (m *memIndex) similarities(q []float32) []float32 {
-	sims := make([]float32, len(m.ids))
+// byDate is the keyword candidates in date order: the entries with every
+// query term if any has them all, else those with any, newest first or
+// oldest first.
+func (m *memIndex) byDate(matched []uint8, terms int, oldest bool) []int32 {
+	var all, some []int32
+	for doc, n := range matched {
+		if int(n) == terms {
+			all = append(all, int32(doc))
+		}
+		if n > 0 {
+			some = append(some, int32(doc))
+		}
+	}
+	if len(all) > 0 {
+		some = all
+	}
+	sort.Slice(some, func(i, j int) bool {
+		a, b := some[i], some[j]
+		if m.ts[a] != m.ts[b] {
+			return (m.ts[a] < m.ts[b]) == oldest
+		}
+		return (m.ids[a] < m.ids[b]) == oldest
+	})
+	return some[:min(len(some), kwCandidates)]
+}
+
+// similarities is each entry's best cosine with q over its vectors, and
+// the row of the vector that gave it. The dot products are split across
+// the cores: 20,000 x 384 is 8 million multiplications.
+func (m *memIndex) similarities(q []float32) ([]float32, []int32) {
+	sims, rows := make([]float32, len(m.ids)), make([]int32, len(m.ids))
 	if m.dim == 0 {
-		return sims
+		return sims, rows
 	}
 	q8, qs := appendInt8(nil, nil, q)
 	rowSims := make([]float32, len(m.vecDoc))
@@ -386,9 +417,11 @@ func (m *memIndex) similarities(q []float32) []float32 {
 		rowSims[i] = qs[0] * m.scale[i] * float32(dot8(q8, m.vecs[i*m.dim:(i+1)*m.dim]))
 	})
 	for i, doc := range m.vecDoc {
-		sims[doc] = max(sims[doc], rowSims[i])
+		if rowSims[i] > sims[doc] {
+			sims[doc], rows[doc] = rowSims[i], int32(i)
+		}
 	}
-	return sims
+	return sims, rows
 }
 
 // appendInt8 appends v as int8 with its own scale: the largest component

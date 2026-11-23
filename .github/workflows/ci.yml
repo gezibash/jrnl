@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # One test needs ffmpeg and skips without it; Linux runs it.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: go vet ./...
+      # Tests that need the embedding model (128 MB) skip where it is not downloaded.
+      - run: go test ./...
+      # As release.sh builds it.
+      - run: GOEXPERIMENT=simd CGO_ENABLED=0 go build -trimpath -o /dev/null .
