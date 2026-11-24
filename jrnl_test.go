@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/knights-analytics/hugot/backends"
 	"io"
@@ -1306,6 +1307,20 @@ func TestKeysFromEnvFile(t *testing.T) {
 			// while another is being served; then the file.
 			if f, err := os.OpenFile(pipe, os.O_WRONLY, 0); err == nil {
 				f.Close()
+			}
+			// Wait until that reader has closed the pipe. Whatever is written
+			// while it still holds the pipe after reading the empty answer is
+			// dropped when it closes, and its next read never gets an answer.
+			for {
+				f, err := os.OpenFile(pipe, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+				if errors.Is(err, syscall.ENXIO) {
+					break
+				}
+				if err != nil {
+					return
+				}
+				f.Close()
+				time.Sleep(time.Millisecond)
 			}
 			f, err := os.OpenFile(pipe, os.O_WRONLY, 0)
 			if err == nil {
