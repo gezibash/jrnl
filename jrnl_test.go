@@ -1007,6 +1007,10 @@ func TestSummarizeSeesWhatWasSettledLater(t *testing.T) {
 	todo := firstID(e.must("Login bug: users are logged out after a refresh.", "add", "--open", "--at", "2026-11-18T09:00:00+01:00"))
 	old := firstID(e.must("Sessions are kept in Redis.", "add", "--kind", "decision", "--at", "2026-11-18T10:00:00+01:00"))
 	newer := firstID(e.must("Sessions move to Postgres.", "add", "--kind", "decision"))
+	// What is open is listed by jrnl from the entries' status.
+	if out := e.must("", "summarize", "--on", "yesterday"); !strings.Contains(out, "### Still open\n* Login bug: users are logged out after a refresh. ["+todo[:14]+"]\n") {
+		t.Errorf("the summary should list the open entry under Still open:\n%s", out)
+	}
 	shown := func() string {
 		t.Helper()
 		e.must("", "summarize", "--on", "yesterday")
@@ -1028,6 +1032,10 @@ func TestSummarizeSeesWhatWasSettledLater(t *testing.T) {
 	}
 	if !strings.Contains(got, "(closed 2026-11-19: The refresh handler raced with the session writer; fixed.)") || strings.Contains(got, "(open)") {
 		t.Errorf("the closed entry should be shown with when and how it was closed:\n%s", got)
+	}
+
+	if out := e.must("", "summarize", "--on", "yesterday"); strings.Contains(out, "Still open") {
+		t.Errorf("with nothing open, the summary should have no Still open section:\n%s", out)
 	}
 
 	// Linked afterwards, from an entry older than the saved summary.

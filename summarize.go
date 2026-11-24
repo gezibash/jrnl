@@ -23,9 +23,14 @@ const (
 // Asked to copy 14-character IDs, Gemma listed 30-90 per bullet (about 8
 // tokens each), ran out of its 4,000-token budget on a 1,512-entry week, and
 // garbled some IDs.
-const summaryRules = "Cover what was done, decisions and why, problems hit and how they were fixed, " +
-	"and what is still open. An entry marked closed or replaced is settled: report it as past, with how " +
-	"it ended, and never as the current state. Under what is still open, list only entries marked (open). " +
+//
+// What is still open is not asked of the model: stillOpen lists it. Asked to
+// list only entries marked (open), Gemma listed a closed todo in 2 of 3
+// runs, from a closing note that mentioned other work as open.
+const summaryRules = "Cover what was done, decisions and why, and problems hit and how they were fixed. " +
+	"An entry marked closed or replaced is settled: report it as past, with how " +
+	"it ended, and never as the current state. Write no section on what is still open: " +
+	"that list is added after your answer. " +
 	"Group short markdown bullets under headings. End each bullet with the " +
 	"numbers of up to 5 entries it comes from, like [12, 40]. Leave out nothing important and add " +
 	"nothing that isn't in the entries. No preamble."
@@ -129,6 +134,7 @@ func summarizeFilter(s *Store, ai *AI, g gitInfo, f Filter, refresh bool) (*Entr
 		body, err = summarizeByDay(s, ai, g, f, refresh, entries, days)
 	} else {
 		body, err = summarizeEntries(s, ai, entries)
+		body += stillOpen(entries)
 	}
 	if err != nil {
 		return nil, err
@@ -186,13 +192,15 @@ func summarizeByDay(s *Store, ai *AI, g gitInfo, f Filter, refresh bool, entries
 		}
 		dayIDs = append(dayIDs, sum.ID[:shortIDLen])
 		body, _, _ := strings.Cut(sum.Body, "\n\n_Covers ")
+		body, _, _ = strings.Cut(body, "\n\n"+openHeading)
 		body = reCiteGroup.ReplaceAllString(body, "") // entry citations stay in the day summary
 		parts = append(parts, fmt.Sprintf("D%d (%s):\n%s", len(dayIDs), days[i], body))
 		footer = append(footer, fmt.Sprintf("%s [%s]", days[i], sum.ID[:shortIDLen]))
 	}
 	prompt := "Write a short overview of this period for a teammate catching up, from the daily summaries below. " +
-		"Use at most 15 bullets in total, under the headings Themes, Decisions, Problems and fixes, and Still open; " +
-		"skip a heading with nothing under it. End each bullet with the days it draws on, like [D2, D5]. " +
+		"Use at most 15 bullets in total, under the headings Themes, Decisions, and Problems and fixes; " +
+		"skip a heading with nothing under it. Write no section on what is still open: that list is added " +
+		"after your answer. End each bullet with the days it draws on, like [D2, D5]. " +
 		"Say nothing that isn't in the summaries. No preamble.\n\n" + strings.Join(parts, "\n\n---\n\n")
 	out, err := ai.chat(prompt, 2000)
 	if err != nil {
@@ -202,7 +210,7 @@ func summarizeByDay(s *Store, ai *AI, g gitInfo, f Filter, refresh bool, entries
 	if dropped > 0 {
 		fmt.Fprintf(os.Stderr, "jrnl: removed %d citations that match no day\n", dropped)
 	}
-	return out + "\n\nDetails by day: " + strings.Join(footer, ", ") + ".", nil
+	return out + stillOpen(entries) + "\n\nDetails by day: " + strings.Join(footer, ", ") + ".", nil
 }
 
 var reDayList = regexp.MustCompile(`^\s*D\d+(\s*[,;]\s*D\d+)*\s*$`)
@@ -371,6 +379,37 @@ func citeIDs(text string, entries []Entry) (string, int) {
 		return "[" + strings.Join(keep, ", ") + "]"
 	})
 	return out, dropped
+}
+
+const (
+	openHeading = "### Still open"
+	openListed  = 15
+)
+
+// stillOpen is a summary's list of the entries that are open now, newest
+// first, or nothing when none is. It comes from the entries' status, not
+// from the model.
+func stillOpen(entries []Entry) string {
+	var lines []string
+	more := 0
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.Status != "open" {
+			continue
+		}
+		if len(lines) == openListed {
+			more++
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("* %s [%s]", e.Title, e.ID[:shortIDLen]))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	if more > 0 {
+		lines = append(lines, fmt.Sprintf("* and %d more: jrnl list --status open", more))
+	}
+	return "\n\n" + openHeading + "\n" + strings.Join(lines, "\n")
 }
 
 // coverage is a summary's last line: what it covers, and how many of those
