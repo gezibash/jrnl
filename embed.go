@@ -143,10 +143,19 @@ type AI struct {
 // fallback instead of waiting.
 func (e *AI) Interactive(deadline time.Duration) *AI {
 	c := *e
-	c.hc = &http.Client{Timeout: deadline}
+	c.hc = &http.Client{Timeout: deadline, Transport: apiTransport}
 	c.attempts = 1
 	return &c
 }
+
+// apiTransport keeps connections to the model APIs open between searches:
+// jrnl serve reranks every few minutes, and a new TLS handshake cost
+// 350-520 ms here. Go's default drops them after 90 s idle.
+var apiTransport = func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.IdleConnTimeout = 10 * time.Minute
+	return t
+}()
 
 // NewAI reads its settings from the environment:
 //
@@ -238,7 +247,7 @@ func loadEnvFile(path string, wait time.Duration) {
 }
 
 func NewAI() (*AI, error) {
-	e := &AI{hc: &http.Client{Timeout: 3 * time.Minute}, attempts: 4, from: map[string]string{}}
+	e := &AI{hc: &http.Client{Timeout: 3 * time.Minute, Transport: apiTransport}, attempts: 4, from: map[string]string{}}
 	c, err := loadConfig(configFile())
 	if err != nil {
 		return nil, err
