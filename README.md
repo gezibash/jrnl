@@ -25,6 +25,23 @@ curl -fsSL https://raw.githubusercontent.com/gezibash/jrnl/main/install.sh | sh
 
 Or download a binary from the releases page, or `go install github.com/gezibash/jrnl@main`.
 
+jrnl is made to run on every agent prompt, so keep a mise shim out of its
+way: each shim runs mise before the tool, 100-300 ms a call. With mise, use
+`mise activate` in your shell and turn shims off, so the real binary is on
+PATH (`jrnl doctor` warns when it finds a shim):
+
+```bash
+mise settings set activate_shims false
+```
+
+For Claude Code, whose commands don't run your shell's prompt hooks, a
+SessionStart hook can put the project's tools on PATH once per session:
+
+```json
+{ "type": "command",
+  "command": "[ -n \"$CLAUDE_ENV_FILE\" ] && p=$(mise bin-paths 2>/dev/null | paste -sd: -) && [ -n \"$p\" ] && echo \"export PATH=\\\"$p:\\$PATH\\\"\" >> \"$CLAUDE_ENV_FILE\" || true" }
+```
+
 Homebrew's own `jrnl` formula is a different program, a Python note taker.
 Install from the tap as shown above. Both install a `jrnl` command, so keep one.
 

@@ -1402,6 +1402,27 @@ model    = "@cf/google/embeddinggemma-2"
 	}
 }
 
+// doctor says when the jrnl on PATH is a mise shim: every call through one
+// runs mise first, 140-330 ms on a Mac with endpoint security.
+func TestDoctorFindsMiseShim(t *testing.T) {
+	e := newEnv(t)
+	dir := t.TempDir()
+	mise := filepath.Join(dir, "mise")
+	os.WriteFile(mise, []byte("#!/bin/sh\n"), 0o755)
+	shims := filepath.Join(dir, "shims")
+	os.Mkdir(shims, 0o755)
+	os.Symlink(mise, filepath.Join(shims, "jrnl"))
+	e.path = shims
+	if out := e.must("", "doctor"); !strings.Contains(out, "mise shim") {
+		t.Errorf("doctor should warn about the shim:\n%s", out)
+	}
+	os.Remove(filepath.Join(shims, "jrnl"))
+	os.Symlink(bin, filepath.Join(shims, "jrnl"))
+	if out := e.must("", "doctor"); strings.Contains(out, "mise shim") {
+		t.Errorf("a real binary on PATH is no shim:\n%s", out)
+	}
+}
+
 // config.toml picks each role's provider and model. JRNL_* variables win: a
 // lone model or key replaces that field, and a URL replaces the whole role,
 // so the file's key never goes to another URL.

@@ -1309,6 +1309,13 @@ func cmdDoctor(args []string) error {
 		fmt.Printf("%-10s %d vector(s) from %s, which is not set up now; `jrnl reindex --prune` deletes them\n", "", u.N, u.Key)
 	}
 	row("basics", true, "add, list, show, keyword search, stats, close", "")
+	if p, err := exec.LookPath("jrnl"); err == nil {
+		if real, err := filepath.EvalSymlinks(p); err == nil && filepath.Base(real) == "mise" {
+			fmt.Printf("%-10s %s is a mise shim: it runs mise before every call (100-300 ms).\n", "speed", p)
+			fmt.Printf("%-10s      put the real binary on PATH: mise settings set activate_shims false,\n", "")
+			fmt.Printf("%-10s      and mise activate in your shell (see the README)\n", "")
+		}
+	}
 
 	// where says which setting chose a role, when it wasn't a default.
 	where := func(role string) string {
