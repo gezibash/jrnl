@@ -1436,6 +1436,12 @@ extra    = { reasoning_effort = "low", kwargs = { thinking = false } }
 	if got := lastChat("JRNL_CHAT_URL="+e.url+"/v1", "JRNL_CHAT_MODEL=env/model"); got["auth"] == "Bearer k-conf" {
 		t.Errorf("the config's key went to the URL set by JRNL_CHAT_URL: %v", got)
 	}
+	// JRNL_CHAT_KEY from the env file still replaces the provider's key.
+	envFile := filepath.Join(t.TempDir(), ".env")
+	os.WriteFile(envFile, []byte("JRNL_CHAT_KEY=k-file\n"), 0o600)
+	if got := lastChat("JRNL_ENV_FILE=" + envFile); got["auth"] != "Bearer k-file" {
+		t.Errorf("JRNL_CHAT_KEY in the env file should win over the provider's key, got %v", got["auth"])
+	}
 
 	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL="} // the config's embedder, not the test default
 	for conf, want := range map[string]string{

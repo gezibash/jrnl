@@ -179,8 +179,8 @@ func (c config) resolve(role string, r roleConf, env string) (endpoint, error) {
 	if m := get("MODEL"); m != "" {
 		e.model = m
 	}
-	if env != "" && get("KEY") != "" {
-		e.key = secret{ref: "JRNL_" + env + "_KEY"}
+	if env != "" {
+		e.key.override = "JRNL_" + env + "_KEY"
 	}
 	return e, nil
 }
@@ -216,11 +216,23 @@ func keyRef(ref string) (secret, error) {
 // when a request needs it. Reading it late is what keeps the env file, a
 // pipe that costs about 50 ms and serves one reader at a time, off every
 // command that needs no key.
-type secret struct{ val, ref string }
+// override, when set, names a JRNL_<ROLE>_KEY that wins over ref.
+type secret struct{ val, ref, override string }
 
 func (s secret) get() string {
-	if s.val != "" || s.ref == "" {
+	if s.val != "" {
 		return s.val
+	}
+	if s.override != "" {
+		if os.Getenv(s.override) == "" {
+			loadEnv()
+		}
+		if v := os.Getenv(s.override); v != "" {
+			return v
+		}
+	}
+	if s.ref == "" {
+		return ""
 	}
 	// A key set to empty, such as none for a local Ollama, is an answer.
 	if v, ok := os.LookupEnv(s.ref); ok {
@@ -241,6 +253,9 @@ func envVar(name string) string {
 var (
 	envMu     sync.Mutex
 	envLoaded time.Time
+	// envWait is how long to wait for a pipe's writer. jrnl serve waits
+	// less: a search waits on it, and it tries again 30 s later.
+	envWait = 10 * time.Second
 )
 
 // loadEnv reads the env file into the environment, once per process; a
@@ -252,6 +267,6 @@ func loadEnv() {
 	if !envLoaded.IsZero() && time.Since(envLoaded) < 30*time.Second {
 		return
 	}
-	loadEnvFile(envFile(), 10*time.Second)
+	loadEnvFile(envFile(), envWait)
 	envLoaded = time.Now()
 }

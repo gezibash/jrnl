@@ -95,6 +95,7 @@ func cmdServe(args []string) error {
 		return err
 	}
 
+	envWait = time.Second
 	// The embedder that wrote the journals' vectors embeds the queries. The
 	// local one is loaded, and downloaded on first use, before the socket
 	// opens; searches meanwhile find no server and do without.
