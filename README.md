@@ -90,7 +90,11 @@ role with an OpenAI-compatible API, so the file's key is never sent to it; a
 Keys that are not in the environment are read from `~/.config/jrnl/.env` (or
 `JRNL_ENV_FILE`), one `KEY=value` per line. That file can be a
 [1Password Environment](https://www.1password.dev/environments/local-env-file)
-mounted as a local `.env` file, so keys never sit on disk.
+mounted as a local `.env` file, so keys never sit on disk. jrnl reads it
+only when a request needs a key, account or model that the environment
+lacks, so commands that call no API (list, show, add, `search --fast`) never
+wait on it. Put the `_URL` that defines a role in `config.toml` or the
+environment, not in this file.
 
 `jrnl doctor` shows which parts are on, which models they use, where each was
 set, and how to turn on the rest. After turning one on, or switching

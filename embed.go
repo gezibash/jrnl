@@ -158,7 +158,7 @@ func (e *AI) Interactive(deadline time.Duration) *AI {
 //	JRNL_CHAT_EXTRA                                   JSON fields added to each chat request
 //	JRNL_RERANK_URL, JRNL_RERANK_KEY, JRNL_RERANK_MODEL  a reranker with a
 //	    Cohere-style /rerank API (Cohere, Voyage, Jina, Vercel AI Gateway)
-//	JRNL_ENV_FILE                                     more of these settings (see envFile)
+//	JRNL_ENV_FILE                                     keys and other values these name, read when missing (see envVar)
 
 // ollamaURL is the OpenAI-compatible API of Ollama at OLLAMA_HOST.
 func ollamaURL() string {
