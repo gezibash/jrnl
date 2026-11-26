@@ -1544,6 +1544,23 @@ func TestProjectBranchAndCommitFromGit(t *testing.T) {
 	if strings.Contains(out, "branch:") || !strings.Contains(out, "commit: "+want+"\n") {
 		t.Errorf("detached HEAD should record the commit and no branch:\n%s", out)
 	}
+
+	// A linked worktree, whose .git is a file: same journal, its own branch,
+	// a commit whose ref is loose in the main repository's refs.
+	wt := filepath.Join(t.TempDir(), "wt")
+	gitc("worktree", "add", "-q", "-b", "wt/branch", wt)
+	gitc("-C", wt, "commit", "-q", "--allow-empty", "-m", "two")
+	wantWT := gitc("-C", wt, "rev-parse", "--short=7", "HEAD")
+	e.dir = wt
+	if out := e.must("", "where"); !strings.HasSuffix(strings.TrimSpace(out), "acme-widget") {
+		t.Errorf("worktree: where = %q, want the origin slug acme-widget", out)
+	}
+	out = e.must("", "show", firstID(e.must("in a worktree", "add")))
+	for _, line := range []string{`branch: "wt/branch"`, "commit: " + wantWT} {
+		if !strings.Contains(out, line+"\n") {
+			t.Errorf("worktree: show is missing %q:\n%s", line, out)
+		}
+	}
 }
 
 // jrnl serve answers over a Unix socket that only this user can open; sees

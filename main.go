@@ -880,18 +880,24 @@ func git(args ...string) string {
 }
 
 // detectGit names the project after its origin remote, so every worktree and
-// clone of one repository shares a journal. A plain repository is read from
-// its .git directory: each git process costs 70-180 ms on a Mac with
-// endpoint security, three of them per command. Anything else (a worktree or
-// submodule, whose .git is a file) asks git.
+// clone of one repository shares a journal. It reads .git itself: each git
+// process costs 70-180 ms on a Mac with endpoint security, three of them per
+// command. A .git file (a linked worktree or a submodule) points at the
+// repository's git directory. Only what it can't read falls back to git.
 func detectGit() gitInfo {
 	wd, _ := os.Getwd()
 	for dir := wd; ; dir = filepath.Dir(dir) {
-		st, err := os.Stat(filepath.Join(dir, ".git"))
-		if err == nil && st.IsDir() {
-			return readGitDir(dir)
+		gd := filepath.Join(dir, ".git")
+		if st, err := os.Stat(gd); err == nil {
+			if st.IsDir() {
+				return readGitDir(dir, gd, gd)
+			}
+			if gd, common, ok := linkedGitDir(dir, gd); ok {
+				return readGitDir(dir, gd, common)
+			}
+			break
 		}
-		if err == nil || filepath.Dir(dir) == dir {
+		if filepath.Dir(dir) == dir {
 			break
 		}
 	}
@@ -906,12 +912,39 @@ func detectGit() gitInfo {
 	return g
 }
 
-// readGitDir reads the origin URL, branch and commit of the repository at
-// top from its .git directory.
-func readGitDir(top string) gitInfo {
-	gd := filepath.Join(top, ".git")
+// linkedGitDir follows a .git file ("gitdir: <path>") to the worktree's own
+// git directory, and its commondir file to the directory shared by every
+// worktree, which holds config and refs. A submodule has no commondir.
+func linkedGitDir(top, file string) (gd, common string, ok bool) {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return "", "", false
+	}
+	gd, ok = strings.CutPrefix(strings.TrimSpace(string(b)), "gitdir: ")
+	if !ok {
+		return "", "", false
+	}
+	if !filepath.IsAbs(gd) {
+		gd = filepath.Join(top, gd)
+	}
+	common = gd
+	if c, err := os.ReadFile(filepath.Join(gd, "commondir")); err == nil {
+		common = strings.TrimSpace(string(c))
+		if !filepath.IsAbs(common) {
+			common = filepath.Join(gd, common)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(gd, "HEAD")); err != nil {
+		return "", "", false
+	}
+	return gd, common, true
+}
+
+// readGitDir reads the origin URL, branch and commit of the checkout at top:
+// HEAD from its git directory gd, config and refs from common.
+func readGitDir(top, gd, common string) gitInfo {
 	g := gitInfo{project: slug(filepath.Base(top))}
-	if url := originURL(gd); url != "" {
+	if url := originURL(common); url != "" {
 		g.project = slugFromRemote(url)
 	}
 	head, _ := os.ReadFile(filepath.Join(gd, "HEAD"))
@@ -919,7 +952,9 @@ func readGitDir(top string) gitInfo {
 	sha := ref
 	if isRef {
 		g.branch = strings.TrimPrefix(ref, "refs/heads/")
-		sha = resolveRef(gd, ref)
+		if sha = resolveRef(gd, ref); sha == "" && common != gd {
+			sha = resolveRef(common, ref)
+		}
 	}
 	if len(sha) >= 7 {
 		g.commit = sha[:7]
