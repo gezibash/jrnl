@@ -676,6 +676,9 @@ func cmdSearch(args []string) error {
 	if _, err := os.Stat(filepath.Join(journalHome(), req.Project, "journal.db")); err != nil {
 		return noJournal{req.Project}
 	}
+	if err := req.Filter.pinDates(); err != nil {
+		return err
+	}
 	if res, ok := serverQuery(ai, req); ok {
 		printWarnings(res.Warn)
 		printHits(os.Stdout, res.Hits)

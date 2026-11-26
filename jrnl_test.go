@@ -1882,6 +1882,18 @@ func TestServeOneServerOfTheCurrentVersion(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Error("the older server is still running after the upgrade")
 	}
+
+	// A search by a binary of another version gets a server of its own
+	// version for the next command: hooks keep an old server alive, so
+	// otherwise an upgrade never reaches the fast path.
+	for _, args := range [][]string{{"add", "Login form rejects valid credentials."}, {"search", "--fast", "Login"}} {
+		c := exec.Command(bin, append(args, "--project", "t")...)
+		c.Env = env
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	waitFor("jrnl dev ")
 	t.Cleanup(func() { socketClient(sock).Post("http://jrnl/quit", "", nil) })
 }
 
@@ -2015,8 +2027,12 @@ func TestSearchRunsInServer(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	e.must("Login form rejects valid credentials.", "add")
+	e.must("Login form rejects valid credentials.", "add", "--kind", "bug")
 	e.must("rerank-me: Login is slow on Mondays.", "add")
+	client := e.extra
+	e.extra = append(client, "CLAUDE_CODE_SESSION_ID=sess-0")
+	e.must("Login from the session before.", "add", "--at", "2 hours ago")
+	e.extra = client
 
 	lastAuth := func() any {
 		e.ai.mu.Lock()
@@ -2026,6 +2042,25 @@ func TestSearchRunsInServer(t *testing.T) {
 	out := e.must("", "search", "Login")
 	if !strings.Contains(strings.SplitN(out, "\n", 2)[0], "rerank-me") || lastAuth() != "Bearer server-key" {
 		t.Errorf("want the server to rerank (auth %v):\n%s", lastAuth(), out)
+	}
+
+	// Filters are the command's: its clock (JRNL_NOW, a week before the
+	// server's), its session, its kind and order.
+	first := func(args ...string) string {
+		out := e.must("", append([]string{"search"}, args...)...)
+		return strings.SplitN(out, "\n", 2)[0]
+	}
+	if got := first("--on", "today", "--kind", "bug", "Login"); !strings.Contains(got, "Login form") {
+		t.Errorf("--on today --kind bug: got %q", got)
+	}
+	if out := e.must("", "search", "--kind", "bug", "Login"); strings.Contains(out, "rerank-me") || strings.Contains(out, "session before") {
+		t.Errorf("--kind bug should show only the bug:\n%s", out)
+	}
+	if out := e.must("", "search", "--session", "last", "Login"); !strings.Contains(out, "session before") || strings.Contains(out, "Login form") {
+		t.Errorf("--session last should show only the earlier session's entry:\n%s", out)
+	}
+	if got := first("--oldest", "Login"); !strings.Contains(got, "session before") {
+		t.Errorf("--oldest: got %q first", got)
 	}
 
 	e.extra = append(e.extra, "JRNL_CHAT_MODEL=test/other")

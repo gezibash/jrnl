@@ -559,6 +559,11 @@ func serverQuery(ai *AI, req query) (queryResult, bool) {
 	}
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK || json.NewDecoder(r.Body).Decode(&res) != nil {
+		// A server of another version (often the one before an upgrade,
+		// which hooks keep alive) is replaced for the next command.
+		if v, _, ok := runningServer(socketPath()); ok && v != version {
+			startServer()
+		}
 		return res, false
 	}
 	return res, true
