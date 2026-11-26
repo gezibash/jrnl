@@ -16,7 +16,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -108,14 +107,16 @@ func format(model string, in Input) string {
 //   - a reranker with a Cohere-style /rerank API.
 //   - media vectors (search --like by look): Cloudflare Workers AI's own API.
 type AI struct {
-	embedURL, embedKey, embedModel, embedID string
-	embedSet                                bool // set by config or JRNL_EMBED_URL, not a default
+	embedURL, embedModel, embedID string
+	embedKey                      secret
+	embedSet                      bool // set by config or JRNL_EMBED_URL, not a default
 	// local: no embeddings API is set up, so bge-small runs in this process,
 	// or in a running jrnl serve (serving: this is that server).
 	// download: this command may download its model (reindex, serve).
 	local, download, serving bool
 
-	chatURL, chatKey, chatModel string
+	chatURL, chatModel string
+	chatKey            secret
 
 	// Vectors of the raw images, video and audio, for search --like. Only
 	// Cloudflare Workers AI is supported; without it, --like compares
@@ -127,9 +128,10 @@ type AI struct {
 	from map[string]string // role: where it was set, for jrnl doctor
 
 	// A dedicated reranker with a Cohere-style /rerank API, optional.
-	rerankURL, rerankKey, rerankModel string
-	chatExtra                         map[string]any // merged into each chat request
-	chatErr                           error          // set when no chat API is set up
+	rerankURL, rerankModel string
+	rerankKey              secret
+	chatExtra              map[string]any // merged into each chat request
+	chatErr                error          // set when no chat API is set up
 
 	hc       *http.Client
 	attempts int
@@ -235,10 +237,7 @@ func loadEnvFile(path string, wait time.Duration) {
 	}
 }
 
-var loadEnvOnce sync.Once
-
 func NewAI() (*AI, error) {
-	loadEnvOnce.Do(func() { loadEnvFile(envFile(), 10*time.Second) })
 	e := &AI{hc: &http.Client{Timeout: 3 * time.Minute}, attempts: 4, from: map[string]string{}}
 	c, err := loadConfig(configFile())
 	if err != nil {
@@ -265,8 +264,11 @@ func NewAI() (*AI, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := chat.cloudflareRoot(); err != nil {
+		e.chatErr = fmt.Errorf("chat: %w", err)
+	}
 	e.chatURL, e.chatKey, e.chatModel, e.chatExtra, e.from["chat"] = chat.url, chat.key, chat.model, chat.extra, chat.from
-	if e.chatURL == "" {
+	if e.chatURL == "" && e.chatErr == nil {
 		e.chatErr = errNoChat
 	}
 	if x := os.Getenv("JRNL_CHAT_EXTRA"); x != "" {
@@ -285,7 +287,7 @@ func NewAI() (*AI, error) {
 	if e.media, err = c.resolve("media_embed", c.MediaEmbed, ""); err != nil {
 		return nil, err
 	}
-	if e.media.run == "" {
+	if e.media.kind == "" {
 		e.mediaErr = errNoMediaEmbed
 	} else {
 		// Workers AI gives the same vectors on any account.
@@ -362,6 +364,9 @@ func (e *AI) embedMedia(req map[string]any, n int) ([][]float32, error) {
 				Embedding []float32 `json:"embedding"`
 			} `json:"data"`
 		} `json:"result"`
+	}
+	if err := e.media.cloudflareRoot(); err != nil {
+		return nil, fmt.Errorf("media embeddings: %w", err)
 	}
 	if err := e.post(e.media.run+"/"+e.media.model, e.media.key, body, &res); err != nil {
 		return nil, fmt.Errorf("media embeddings: %w", err)
@@ -468,7 +473,8 @@ type unreachable struct{ error }
 // post sends JSON to an API and decodes the reply. It retries rate limits,
 // server errors and network failures with backoff, so a burst from many
 // parallel sessions slows down instead of failing.
-func (e *AI) post(url, key string, body []byte, out any) error {
+func (e *AI) post(url string, sk secret, body []byte, out any) error {
+	key := sk.get()
 	var last error
 	for attempt := 0; attempt < e.attempts; attempt++ {
 		if attempt > 0 {

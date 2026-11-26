@@ -1360,6 +1360,48 @@ func TestEnvFileWithoutWriter(t *testing.T) {
 	}
 }
 
+// The env file is read only for a value jrnl needs and lacks. With every key
+// in the environment, a pipe nobody answers costs nothing: before, each
+// command waited 10 s for it and warned.
+func TestEnvFileReadOnlyWhenNeeded(t *testing.T) {
+	e := newEnv(t)
+	pipe := filepath.Join(t.TempDir(), ".env")
+	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.extra = []string{"JRNL_ENV_FILE=" + pipe}
+	for _, args := range [][]string{{"add"}, {"search", "Login"}, {"list"}} {
+		start := time.Now()
+		_, errOut, err := e.run("Login form rejects valid credentials.", args...)
+		if err != nil || strings.Contains(errOut, "skipped") || time.Since(start) > 5*time.Second {
+			t.Errorf("%v: %v after %v, stderr %q", args, err, time.Since(start), errOut)
+		}
+	}
+}
+
+// A role whose Cloudflare account variable is unset is off; everything else
+// still works. Before, search and doctor failed with "set account".
+func TestCloudflareAccountUnset(t *testing.T) {
+	e := newEnv(t)
+	e.config = `
+[providers.cf]
+type    = "cloudflare"
+account = "env:JRNL_TEST_NO_ACCOUNT"
+key     = "env:JRNL_TEST_CF_KEY"
+
+[media_embed]
+provider = "cf"
+model    = "@cf/google/embeddinggemma-2"
+`
+	e.must("Login form rejects valid credentials.", "add")
+	if out := e.must("", "search", "Login"); !strings.Contains(out, "Login form") {
+		t.Errorf("search should still find the entry:\n%s", out)
+	}
+	if out := e.must("", "doctor"); !strings.Contains(out, "JRNL_TEST_NO_ACCOUNT") {
+		t.Errorf("doctor should name the unset account variable:\n%s", out)
+	}
+}
+
 // config.toml picks each role's provider and model. JRNL_* variables win: a
 // lone model or key replaces that field, and a URL replaces the whole role,
 // so the file's key never goes to another URL.

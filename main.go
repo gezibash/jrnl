@@ -1255,10 +1255,15 @@ func cmdDoctor(args []string) error {
 			ai.rerankModel+" at "+ai.rerankURL+where("rerank"))
 	}
 	how = "[media_embed] with a cloudflare provider in config.toml; until then --like compares descriptions"
-	if ai.mediaErr == nil {
-		how = ai.media.model + " at " + ai.media.run + where("media_embed")
+	mediaOn := ai.mediaErr == nil
+	if mediaOn {
+		if err := ai.media.cloudflareRoot(); err != nil {
+			mediaOn, how = false, err.Error()
+		} else {
+			how = ai.media.model + " at " + ai.media.run + where("media_embed")
+		}
 	}
-	row("--like", ai.mediaErr == nil, "find attachments that look or sound alike", how)
+	row("--like", mediaOn, "find attachments that look or sound alike", how)
 	_, ffErr := exec.LookPath("ffmpeg")
 	how = ""
 	if ffErr != nil {

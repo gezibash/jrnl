@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -90,7 +92,8 @@ type endpoint struct {
 	kind  string // provider type: openai or cloudflare
 	url   string // OpenAI-compatible base, …/v1
 	run   string // cloudflare: Workers AI's own API, …/ai/run
-	key   string
+	acct  secret // cloudflare without a url: the account, for run and url
+	key   secret
 	model string
 	extra map[string]any
 	from  string // where it was set, for jrnl doctor
@@ -109,8 +112,12 @@ func (c config) resolve(role string, r roleConf, env string) (endpoint, error) {
 	}
 	var e endpoint
 	if u := get("URL"); u != "" {
-		e = endpoint{kind: "openai", url: strings.TrimSuffix(u, "/"), key: get("KEY"), model: get("MODEL"),
-			from: "JRNL_" + env + "_URL"}
+		e = endpoint{kind: "openai", url: strings.TrimSuffix(u, "/"), key: secret{ref: "JRNL_" + env + "_KEY"},
+			model: get("MODEL"), from: "JRNL_" + env + "_URL"}
+		if e.model == "" {
+			// It may be in the env file, read only for a value that is missing.
+			e.model = envVar("JRNL_" + env + "_MODEL")
+		}
 		if e.model == "" {
 			return e, fmt.Errorf("JRNL_%s_URL is set, so set JRNL_%s_MODEL too", env, env)
 		}
@@ -120,7 +127,10 @@ func (c config) resolve(role string, r roleConf, env string) (endpoint, error) {
 		if r.Model != "" || r.Extra != nil {
 			return e, fmt.Errorf("config [%s] needs a provider", role)
 		}
-		e.model, e.key = get("MODEL"), get("KEY")
+		e.model = get("MODEL")
+		if env != "" {
+			e.key = secret{ref: "JRNL_" + env + "_KEY"}
+		}
 		return e, nil
 	}
 	p, ok := c.Providers[r.Provider]
@@ -149,18 +159,19 @@ func (c config) resolve(role string, r roleConf, env string) (endpoint, error) {
 		}
 		e.url = strings.TrimSuffix(p.URL, "/")
 	case "cloudflare":
-		root := strings.TrimSuffix(p.URL, "/")
-		if root == "" {
-			acct := p.Account
-			if name, ok := strings.CutPrefix(acct, "env:"); ok {
-				acct = os.Getenv(name)
-			}
-			if acct == "" {
-				return e, fmt.Errorf("config [providers.%s]: set account (the ID, or env:NAME)", r.Provider)
-			}
-			root = "https://api.cloudflare.com/client/v4/accounts/" + acct + "/ai"
+		if root := strings.TrimSuffix(p.URL, "/"); root != "" {
+			e.url, e.run = root+"/v1", root+"/run"
+			break
 		}
-		e.url, e.run = root+"/v1", root+"/run"
+		// The account may come from the env file: it is looked up when the
+		// role is used (cloudflareRoot), so other commands never read it.
+		if name, ok := strings.CutPrefix(p.Account, "env:"); ok && name != "" {
+			e.acct = secret{ref: name}
+		} else if p.Account != "" {
+			e.acct = secret{val: p.Account}
+		} else {
+			return e, fmt.Errorf("config [providers.%s]: set account (the ID, or env:NAME)", r.Provider)
+		}
 	}
 	if e.model == "" {
 		return e, fmt.Errorf("config [%s]: set model", role)
@@ -168,20 +179,79 @@ func (c config) resolve(role string, r roleConf, env string) (endpoint, error) {
 	if m := get("MODEL"); m != "" {
 		e.model = m
 	}
-	if k := get("KEY"); k != "" {
-		e.key = k
+	if env != "" && get("KEY") != "" {
+		e.key = secret{ref: "JRNL_" + env + "_KEY"}
 	}
 	return e, nil
 }
 
-// keyRef reads a key from the variable it names. Keys never sit in the file.
-func keyRef(ref string) (string, error) {
+// cloudflareRoot fills in run and url from the account, for a Cloudflare
+// endpoint set up with one; an error names the variable that is unset.
+func (e *endpoint) cloudflareRoot() error {
+	if e.run != "" || e.kind != "cloudflare" {
+		return nil
+	}
+	acct := e.acct.get()
+	if acct == "" {
+		return fmt.Errorf("set %s to the Cloudflare account ID", e.acct.ref)
+	}
+	root := "https://api.cloudflare.com/client/v4/accounts/" + acct + "/ai"
+	e.url, e.run = root+"/v1", root+"/run"
+	return nil
+}
+
+// keyRef is the key in the variable a provider names. Keys never sit in the file.
+func keyRef(ref string) (secret, error) {
 	if ref == "" {
-		return "", nil
+		return secret{}, nil
 	}
 	name, ok := strings.CutPrefix(ref, "env:")
 	if !ok || name == "" {
-		return "", errors.New(`key must name a variable, like key = "env:MY_API_KEY"; config.toml holds no keys`)
+		return secret{}, errors.New(`key must name a variable, like key = "env:MY_API_KEY"; config.toml holds no keys`)
 	}
-	return os.Getenv(name), nil
+	return secret{ref: name}, nil
+}
+
+// secret is a key or account: a value, or the variable that holds it, read
+// when a request needs it. Reading it late is what keeps the env file, a
+// pipe that costs about 50 ms and serves one reader at a time, off every
+// command that needs no key.
+type secret struct{ val, ref string }
+
+func (s secret) get() string {
+	if s.val != "" || s.ref == "" {
+		return s.val
+	}
+	// A key set to empty, such as none for a local Ollama, is an answer.
+	if v, ok := os.LookupEnv(s.ref); ok {
+		return v
+	}
+	return envVar(s.ref)
+}
+
+// envVar is the variable from the environment, or else from the env file.
+func envVar(name string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	loadEnv()
+	return os.Getenv(name)
+}
+
+var (
+	envMu     sync.Mutex
+	envLoaded time.Time
+)
+
+// loadEnv reads the env file into the environment, once per process; a
+// long-running jrnl serve reads it again for a value still missing after
+// 30 s, so unlocking 1Password later is noticed without a restart.
+func loadEnv() {
+	envMu.Lock()
+	defer envMu.Unlock()
+	if !envLoaded.IsZero() && time.Since(envLoaded) < 30*time.Second {
+		return
+	}
+	loadEnvFile(envFile(), 10*time.Second)
+	envLoaded = time.Now()
 }
