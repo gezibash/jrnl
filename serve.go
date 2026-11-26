@@ -212,6 +212,7 @@ func newServer(ai *AI) *server {
 	})
 	sv.mux.HandleFunc("GET /search", sv.handleSearch)
 	sv.mux.HandleFunc("POST /embed", sv.handleEmbed)
+	sv.mux.HandleFunc("POST /query", sv.handleQuery)
 	go func() {
 		for range time.Tick(time.Minute) {
 			sv.mu.Lock()
@@ -495,4 +496,70 @@ func serverEmbed(inputs []string) ([][]float32, bool) {
 		return nil, false
 	}
 	return vecs, true
+}
+
+// settings names what decides a search's results, keys aside: the
+// embedder, the chat model and the reranker.
+func (e *AI) settings() string {
+	extra, _ := json.Marshal(e.chatExtra)
+	return strings.Join([]string{e.embedID, e.chatURL, e.chatModel, string(extra), e.rerankURL, e.rerankModel}, "|")
+}
+
+// handleQuery runs a command's whole text search: ranking from memory under
+// the lock, then the reranker outside it, over a connection kept warm
+// between searches. It refuses a client of another version or settings
+// (409), which then searches by itself; when its own settings file has
+// moved on, the server also quits, so the next command starts a current one.
+func (sv *server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	var req query
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Q == "" || req.Project != slug(req.Project) || req.Project == "" {
+		http.Error(w, "give project and q", http.StatusBadRequest)
+		return
+	}
+	if req.Version != version || req.Settings != sv.ai.settings() {
+		if now, err := NewAI(); err == nil && now.settings() != sv.ai.settings() {
+			sv.stop()
+		}
+		http.Error(w, "this server is "+version+" with other settings", http.StatusConflict)
+		return
+	}
+	sv.mu.Lock()
+	sv.last = time.Now()
+	p, err := sv.project(req.Project)
+	var hits []Hit
+	var hasVec bool
+	var warns []string
+	if err == nil {
+		hits, hasVec, warns, err = rankHits(p.s, sv.ai, p.idx, req)
+	}
+	sv.mu.Unlock()
+	if errors.Is(err, os.ErrNotExist) {
+		http.Error(w, "no journal for "+req.Project, http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	hits, more := finishHits(sv.ai, req, hits, hasVec)
+	json.NewEncoder(w).Encode(queryResult{Hits: hits, Warn: append(warns, more...)})
+}
+
+// serverQuery asks a running jrnl serve to run a search; ok is false when
+// none answers for this version and these settings.
+func serverQuery(ai *AI, req query) (queryResult, bool) {
+	req.Version, req.Settings = version, ai.settings()
+	body, _ := json.Marshal(req)
+	c := socketClient(socketPath())
+	c.Timeout = embedDeadline + rerankDeadline + 2*time.Second
+	var res queryResult
+	r, err := c.Post("http://jrnl/query", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return res, false
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK || json.NewDecoder(r.Body).Decode(&res) != nil {
+		return res, false
+	}
+	return res, true
 }

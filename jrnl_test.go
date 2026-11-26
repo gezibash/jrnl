@@ -1981,6 +1981,63 @@ func serveEnv(home string) []string {
 		"JRNL_ENV_FILE="+filepath.Join(home, "no-env"), "JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR="+localDir())
 }
 
+// jrnl search hands the whole search, reranking included, to a running jrnl
+// serve: the reranker sees the server's key, not the command's. A command
+// whose settings differ searches by itself, and the server stays up.
+func TestSearchRunsInServer(t *testing.T) {
+	needLocalModel(t)
+	e := newEnv(t)
+	home, err := os.MkdirTemp("/tmp", "jrq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	e.home = home
+	quitServerAt(t, home)
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + localDir(), "JRNL_CHAT_KEY=client-key"}
+
+	// Started first, so the adds embed through it instead of starting one
+	// with the command's key.
+	sock := filepath.Join(home, ".run", "jrnl.sock")
+	srv := exec.Command(bin, "serve")
+	srv.Env = append(serveEnv(home), "JRNL_CHAT_URL="+e.url+"/v1", "JRNL_CHAT_KEY=server-key",
+		"JRNL_CHAT_MODEL=test/vision", "JRNL_CHAT_EXTRA=", "JRNL_RERANK_URL=")
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Process.Kill(); srv.Wait() })
+	for i := 0; ; i++ {
+		if _, _, ok := runningServer(sock); ok {
+			break
+		}
+		if i == 200 {
+			t.Fatal("jrnl serve did not start")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	e.must("Login form rejects valid credentials.", "add")
+	e.must("rerank-me: Login is slow on Mondays.", "add")
+
+	lastAuth := func() any {
+		e.ai.mu.Lock()
+		defer e.ai.mu.Unlock()
+		return e.ai.chatReqs[len(e.ai.chatReqs)-1]["auth"]
+	}
+	out := e.must("", "search", "Login")
+	if !strings.Contains(strings.SplitN(out, "\n", 2)[0], "rerank-me") || lastAuth() != "Bearer server-key" {
+		t.Errorf("want the server to rerank (auth %v):\n%s", lastAuth(), out)
+	}
+
+	e.extra = append(e.extra, "JRNL_CHAT_MODEL=test/other")
+	out = e.must("", "search", "Login")
+	if !strings.Contains(strings.SplitN(out, "\n", 2)[0], "rerank-me") || lastAuth() != "Bearer client-key" {
+		t.Errorf("with other settings the command should rerank by itself (auth %v):\n%s", lastAuth(), out)
+	}
+	if _, _, ok := runningServer(sock); !ok {
+		t.Error("the server should stay up for commands with its own settings")
+	}
+}
+
 // With no embeddings API set up, jrnl embeds in its own process: a reworded
 // question finds the entry, and doctor says where the model is. Uses the
 // real model, so it runs only where it is downloaded.
