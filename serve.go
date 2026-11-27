@@ -187,6 +187,9 @@ type server struct {
 	// and embedding new entries for it: the server quits instead, and the
 	// next one starts with the model the settings name.
 	reconfigured func() bool
+	// settingsAt is when a refused client last made this server read its
+	// settings again; it does that at most once in 10 s.
+	settingsAt time.Time
 }
 
 // served is one project's journal and its in-memory index, rebuilt when
@@ -438,6 +441,10 @@ var startOnce sync.Once
 // embeds the entries that waited for it.
 func startServer() {
 	startOnce.Do(func() {
+		// One of this version, or a newer one, already serves.
+		if v, _, ok := runningServer(socketPath()); ok && !older(v, version) {
+			return
+		}
 		exe, err := os.Executable()
 		if err != nil {
 			return
@@ -517,11 +524,23 @@ func (sv *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "give project and q", http.StatusBadRequest)
 		return
 	}
-	if req.Version != version || req.Settings != sv.ai.settings() {
-		if now, err := NewAI(); err == nil && now.settings() != sv.ai.settings() {
-			sv.stop()
+	if req.Version != version {
+		http.Error(w, "this server is "+version, http.StatusConflict)
+		return
+	}
+	if req.Settings != sv.ai.settings() {
+		sv.mu.Lock()
+		check := time.Since(sv.settingsAt) > 10*time.Second
+		if check {
+			sv.settingsAt = time.Now()
 		}
-		http.Error(w, "this server is "+version+" with other settings", http.StatusConflict)
+		sv.mu.Unlock()
+		if check {
+			if now, err := NewAI(); err == nil && now.settings() != sv.ai.settings() {
+				sv.stop()
+			}
+		}
+		http.Error(w, "this server has other settings", http.StatusConflict)
 		return
 	}
 	sv.mu.Lock()
@@ -539,7 +558,9 @@ func (sv *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// The command would fail the same way by itself (a bad filter, an
+		// unknown session): it reports this, and does not search again.
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
 	hits, more := finishHits(sv.ai, req, hits, hasVec)
@@ -547,25 +568,52 @@ func (sv *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 // serverQuery asks a running jrnl serve to run a search; ok is false when
-// none answers for this version and these settings.
-func serverQuery(ai *AI, req query) (queryResult, bool) {
+// none answers for this version and these settings. err is the search's
+// own failure, which the command reports.
+func serverQuery(ai *AI, req query) (res queryResult, ok bool, err error) {
 	req.Version, req.Settings = version, ai.settings()
 	body, _ := json.Marshal(req)
 	c := socketClient(socketPath())
 	c.Timeout = embedDeadline + rerankDeadline + 2*time.Second
-	var res queryResult
 	r, err := c.Post("http://jrnl/query", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return res, false
+		return res, false, nil
 	}
 	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK || json.NewDecoder(r.Body).Decode(&res) != nil {
-		// A server of another version (often the one before an upgrade,
-		// which hooks keep alive) is replaced for the next command.
-		if v, _, ok := runningServer(socketPath()); ok && v != version {
-			startServer()
-		}
-		return res, false
+	if r.StatusCode == http.StatusUnprocessableEntity {
+		msg, _ := io.ReadAll(r.Body)
+		return res, false, errors.New(strings.TrimSpace(string(msg)))
 	}
-	return res, true
+	if r.StatusCode != http.StatusOK || json.NewDecoder(r.Body).Decode(&res) != nil {
+		// An older server (often the one before an upgrade, which hooks
+		// keep alive) is replaced for the next command.
+		startServer()
+		return res, false, nil
+	}
+	return res, true, nil
+}
+
+// older says server version a is older than b. A build without a release
+// number (dev) is newer than any release. A binary replaces only an older
+// server, so two installed versions never take turns replacing each other.
+func older(a, b string) bool {
+	parse := func(v string) []int {
+		var n []int
+		for _, p := range strings.Split(strings.TrimPrefix(v, "v"), ".") {
+			i, err := strconv.Atoi(p)
+			if err != nil {
+				return nil
+			}
+			n = append(n, i)
+		}
+		return n
+	}
+	na, nb := parse(a), parse(b)
+	switch {
+	case na == nil:
+		return false
+	case nb == nil:
+		return true
+	}
+	return slices.Compare(na, nb) < 0
 }

@@ -108,10 +108,14 @@ Keys that are not in the environment are read from `~/.config/jrnl/.env` (or
 `JRNL_ENV_FILE`), one `KEY=value` per line. That file can be a
 [1Password Environment](https://www.1password.dev/environments/local-env-file)
 mounted as a local `.env` file, so keys never sit on disk. jrnl reads it
-only when a request needs a key, account or model that the environment
-lacks, so commands that call no API (list, show, add, `search --fast`) never
-wait on it. Put the `_URL` that defines a role in `config.toml` or the
-environment, not in this file.
+only when a request needs a key or account that the environment lacks, so
+commands that call no API (list, show, add, `search --fast`) never wait on
+it. The file is for keys and accounts. Put every other setting (`_URL`,
+`_MODEL`, `JRNL_CHAT_EXTRA`, `OLLAMA_HOST`) in `config.toml` or the
+environment: jrnl ignores them in this file, except a `_MODEL` for a role
+whose `_URL` names no model. A command waits up to 10 s for the file and
+`jrnl serve` 1 s; the server's read goes on behind it, so a 1Password prompt
+approved later still reaches the server.
 
 `jrnl doctor` shows which parts are on, which models they use, where each was
 set, and how to turn on the rest. After turning one on, or switching

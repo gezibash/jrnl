@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -1347,16 +1348,51 @@ func TestKeysFromEnvFile(t *testing.T) {
 }
 
 // A mounted pipe that nobody answers (1Password closed or its prompt not
-// approved) must not hang jrnl.
+// approved) must not hang jrnl, nor leave a blocked reader behind for each
+// try; and a prompt approved after jrnl stopped waiting still delivers the
+// keys, which a long-running jrnl serve needs.
 func TestEnvFileWithoutWriter(t *testing.T) {
 	pipe := filepath.Join(t.TempDir(), ".env")
 	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("JRNL_ENV_FILE", pipe)
+	os.Unsetenv("JRNL_LATE_KEY")
+	t.Cleanup(func() { os.Unsetenv("JRNL_LATE_KEY") })
+	oldWait, oldRetry := envWait, envRetry
+	envWait, envRetry, envDone = 100*time.Millisecond, 0, time.Time{}
+	t.Cleanup(func() {
+		envMu.Lock()
+		defer envMu.Unlock()
+		envWait, envRetry, envDone = oldWait, oldRetry, time.Time{}
+	})
+
+	before := runtime.NumGoroutine()
 	start := time.Now()
-	loadEnvFile(pipe, 200*time.Millisecond)
+	for range 5 {
+		loadEnv()
+	}
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("waited %v for a pipe with no writer", d)
+	}
+	if n := runtime.NumGoroutine() - before; n > 1 {
+		t.Errorf("%d readers left blocked on the pipe; want at most 1", n)
+	}
+
+	w, err := os.OpenFile(pipe, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.WriteString("JRNL_LATE_KEY=late\n")
+	w.Close()
+	for range 50 {
+		if os.Getenv("JRNL_LATE_KEY") != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := os.Getenv("JRNL_LATE_KEY"); got != "late" {
+		t.Errorf("a key written after jrnl stopped waiting was lost: got %q", got)
 	}
 }
 
@@ -1415,6 +1451,11 @@ func TestDoctorFindsMiseShim(t *testing.T) {
 	e.path = shims
 	if out := e.must("", "doctor"); !strings.Contains(out, "mise shim") {
 		t.Errorf("doctor should warn about the shim:\n%s", out)
+	}
+	os.Remove(filepath.Join(shims, "jrnl"))
+	os.WriteFile(filepath.Join(shims, "jrnl"), []byte("#!/bin/sh\nexec mise x -- jrnl \"$@\"\n"), 0o755)
+	if out := e.must("", "doctor"); !strings.Contains(out, "mise shim") {
+		t.Errorf("doctor should warn about a script shim:\n%s", out)
 	}
 	os.Remove(filepath.Join(shims, "jrnl"))
 	os.Symlink(bin, filepath.Join(shims, "jrnl"))
@@ -1922,6 +1963,19 @@ func TestServeOneServerOfTheCurrentVersion(t *testing.T) {
 	}
 	waitFor("jrnl dev ")
 	t.Cleanup(func() { socketClient(sock).Post("http://jrnl/quit", "", nil) })
+
+	// An older binary's search leaves the newer server alone (dev is newer
+	// than any release): two installed versions must not take turns
+	// replacing each other, each replacement reloading the model.
+	c := exec.Command(newer, "search", "--fast", "Login", "--project", "t")
+	c.Env = env
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("search by 9.9.9: %v\n%s", err, out)
+	}
+	time.Sleep(2 * time.Second)
+	if got := health(); !strings.HasPrefix(got, "jrnl dev ") {
+		t.Errorf("an older binary's search replaced the newer server: health %q", got)
+	}
 }
 
 // A decision can say which earlier one it replaces, at add time or later
@@ -2198,11 +2252,11 @@ func TestBrokenModelWaits(t *testing.T) {
 // them, and refuses a file that is not the one expected.
 func TestModelDownload(t *testing.T) {
 	needLocalModel(t)
-	var corrupt bool
+	var corrupt atomic.Bool // the background server reads it too
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for _, f := range localFiles {
 			if r.URL.Path == "/"+localRepo+"/resolve/"+localRev+"/"+f[1] {
-				if corrupt && f[0] == "model.onnx" {
+				if corrupt.Load() && f[0] == "model.onnx" {
 					io.WriteString(w, "<html>please log in to the hotel wifi</html>")
 					return
 				}
@@ -2217,7 +2271,7 @@ func TestModelDownload(t *testing.T) {
 	quitServerAt(t, e.home)
 	dir := filepath.Join(t.TempDir(), "model")
 	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + dir, "JRNL_MODELS_URL=" + hub.URL}
-	corrupt = true // before add, whose background server downloads too
+	corrupt.Store(true) // before add, whose background server downloads too
 	e.must("Users could not sign in after the token refresh.", "add")
 	if _, errOut, _ := e.run("", "reindex"); !strings.Contains(errOut, "SHA-256") {
 		t.Errorf("a wrong file should be refused: %q", errOut)
@@ -2225,7 +2279,7 @@ func TestModelDownload(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "model.onnx")); err == nil {
 		t.Error("the wrong file was kept")
 	}
-	corrupt = false
+	corrupt.Store(false)
 	if out := e.must("", "reindex"); !strings.Contains(out, "embedded 1 ") {
 		t.Fatalf("reindex after downloading: %q", out)
 	}

@@ -188,16 +188,23 @@ func (c config) resolve(role string, r roleConf, env string) (endpoint, error) {
 // cloudflareRoot fills in run and url from the account, for a Cloudflare
 // endpoint set up with one; an error names the variable that is unset.
 func (e *endpoint) cloudflareRoot() error {
+	url, run, err := e.cloudflareURLs()
+	e.url, e.run = url, run
+	return err
+}
+
+// cloudflareURLs is the endpoint's url and run, read from the account when
+// they are not set. It changes nothing, so parallel embeds can call it.
+func (e endpoint) cloudflareURLs() (url, run string, err error) {
 	if e.run != "" || e.kind != "cloudflare" {
-		return nil
+		return e.url, e.run, nil
 	}
 	acct := e.acct.get()
 	if acct == "" {
-		return fmt.Errorf("set %s to the Cloudflare account ID", e.acct.ref)
+		return e.url, e.run, fmt.Errorf("set %s to the Cloudflare account ID", e.acct.ref)
 	}
 	root := "https://api.cloudflare.com/client/v4/accounts/" + acct + "/ai"
-	e.url, e.run = root+"/v1", root+"/run"
-	return nil
+	return root + "/v1", root + "/run", nil
 }
 
 // keyRef is the key in the variable a provider names. Keys never sit in the file.
@@ -251,22 +258,52 @@ func envVar(name string) string {
 }
 
 var (
-	envMu     sync.Mutex
-	envLoaded time.Time
-	// envWait is how long to wait for a pipe's writer. jrnl serve waits
-	// less: a search waits on it, and it tries again 30 s later.
+	envMu sync.Mutex
+	// envDone is when the last read ended or a command stopped waiting
+	// for it; envReading is closed when the read in flight ends.
+	envDone    time.Time
+	envReading chan struct{}
+	// envWait is how long a command waits for a pipe's writer. jrnl serve
+	// waits less: a search waits on it, and the read goes on behind it.
 	envWait = 10 * time.Second
+	// envRetry is how soon a value still missing sends jrnl back to the file.
+	envRetry = 30 * time.Second
 )
 
-// loadEnv reads the env file into the environment, once per process; a
-// long-running jrnl serve reads it again for a value still missing after
-// 30 s, so unlocking 1Password later is noticed without a restart.
+// loadEnv reads the env file into the environment. At most one read is in
+// flight: one that outlasts envWait goes on in the background, so a
+// 1Password prompt approved later still delivers its keys to a long-running
+// jrnl serve, and a pipe nobody answers costs one blocked reader, not one
+// per search. A value still missing sends jrnl back to the file after
+// envRetry, so unlocking 1Password later is noticed without a restart.
 func loadEnv() {
 	envMu.Lock()
-	defer envMu.Unlock()
-	if !envLoaded.IsZero() && time.Since(envLoaded) < 30*time.Second {
+	if !envDone.IsZero() && time.Since(envDone) < envRetry {
+		envMu.Unlock()
 		return
 	}
-	loadEnvFile(envFile(), envWait)
-	envLoaded = time.Now()
+	done := envReading
+	if done == nil {
+		done = make(chan struct{})
+		envReading = done
+		path := envFile()
+		go func() {
+			if err := readEnvFile(path); err != nil {
+				fmt.Fprintf(os.Stderr, "jrnl: skipped %s: %v\n", path, err)
+			}
+			envMu.Lock()
+			envReading, envDone = nil, time.Now()
+			envMu.Unlock()
+			close(done)
+		}()
+	}
+	envMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(envWait):
+		fmt.Fprintf(os.Stderr, "jrnl: skipped %s: no answer in %v; is 1Password unlocked, and was its prompt approved?\n", envFile(), envWait)
+		envMu.Lock()
+		envDone = time.Now()
+		envMu.Unlock()
+	}
 }

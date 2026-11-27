@@ -679,7 +679,9 @@ func cmdSearch(args []string) error {
 	if err := req.Filter.pinDates(); err != nil {
 		return err
 	}
-	if res, ok := serverQuery(ai, req); ok {
+	if res, ok, err := serverQuery(ai, req); err != nil {
+		return err
+	} else if ok {
 		printWarnings(res.Warn)
 		printHits(os.Stdout, res.Hits)
 		return nil
@@ -1310,7 +1312,7 @@ func cmdDoctor(args []string) error {
 	}
 	row("basics", true, "add, list, show, keyword search, stats, close", "")
 	if p, err := exec.LookPath("jrnl"); err == nil {
-		if real, err := filepath.EvalSymlinks(p); err == nil && filepath.Base(real) == "mise" {
+		if isMiseShim(p) {
 			fmt.Printf("%-10s %s is a mise shim: it runs mise before every call (100-300 ms).\n", "speed", p)
 			fmt.Printf("%-10s      put the real binary on PATH: mise settings set activate_shims false,\n", "")
 			fmt.Printf("%-10s      and mise activate in your shell (see the README)\n", "")
@@ -1344,10 +1346,10 @@ func cmdDoctor(args []string) error {
 	how = "[media_embed] with a cloudflare provider in config.toml; until then --like compares descriptions"
 	mediaOn := ai.mediaErr == nil
 	if mediaOn {
-		if err := ai.media.cloudflareRoot(); err != nil {
+		if _, run, err := ai.media.cloudflareURLs(); err != nil {
 			mediaOn, how = false, err.Error()
 		} else {
-			how = ai.media.model + " at " + ai.media.run + where("media_embed")
+			how = ai.media.model + " at " + run + where("media_embed")
 		}
 	}
 	row("--like", mediaOn, "find attachments that look or sound alike", how)
@@ -1402,4 +1404,24 @@ func embedStatus(ai *AI) (bool, string) {
 			"`; or set [embed] in config.toml (or JRNL_EMBED_URL, JRNL_EMBED_MODEL) for any OpenAI-compatible API"
 	}
 	return false, err.Error()
+}
+
+// isMiseShim says the jrnl at p runs mise first: a link to the mise binary,
+// or a script that calls it.
+func isMiseShim(p string) bool {
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return false
+	}
+	if filepath.Base(real) == "mise" {
+		return true
+	}
+	f, err := os.Open(real)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head := make([]byte, 512)
+	n, _ := io.ReadFull(f, head)
+	return strings.HasPrefix(string(head[:n]), "#!") && strings.Contains(string(head[:n]), "mise")
 }

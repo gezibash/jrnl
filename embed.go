@@ -192,45 +192,29 @@ func envFile() string {
 	return filepath.Join(home, ".config", "jrnl", ".env")
 }
 
-// loadEnvFile sets each KEY=VALUE from the file that the environment does
-// not already set. A missing file is fine. A named pipe whose writer does not
-// answer within wait (1Password closed, or its prompt not yet approved) is
-// skipped with a warning, so jrnl still saves entries, without the keys.
-func loadEnvFile(path string, wait time.Duration) {
+// readEnvFile sets each KEY=VALUE from the file that the environment does
+// not already set. A missing file is fine. A named pipe blocks until its
+// writer answers (1Password unlocked and its prompt approved); loadEnv
+// decides how long a command waits for that.
+func readEnvFile(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
-		return
+		return nil
 	}
 	pipe := info.Mode()&os.ModeNamedPipe != 0
-	type result struct {
-		data []byte
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		// 1Password serves one reader at a time: of 5 jrnl processes reading
-		// at once, 2 got an empty file. An empty pipe is read again.
-		var data []byte
-		var err error
-		for i := range 20 {
-			if data, err = os.ReadFile(path); err != nil || !pipe || len(bytes.TrimSpace(data)) > 0 {
-				break
-			}
-			time.Sleep(time.Duration(25*(i+1)) * time.Millisecond)
+	// 1Password serves one reader at a time: of 5 jrnl processes reading
+	// at once, 2 got an empty file. An empty pipe is read again.
+	var data []byte
+	for i := range 20 {
+		if data, err = os.ReadFile(path); err != nil || !pipe || len(bytes.TrimSpace(data)) > 0 {
+			break
 		}
-		done <- result{data, err}
-	}()
-	var r result
-	select {
-	case r = <-done:
-	case <-time.After(wait):
-		r.err = fmt.Errorf("no answer in %v; is 1Password unlocked, and was its prompt approved?", wait)
+		time.Sleep(time.Duration(25*(i+1)) * time.Millisecond)
 	}
-	if r.err != nil {
-		fmt.Fprintf(os.Stderr, "jrnl: skipped %s: %v\n", path, r.err)
-		return
+	if err != nil {
+		return err
 	}
-	for _, line := range strings.Split(string(r.data), "\n") {
+	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
 		k, v, ok := strings.Cut(line, "=")
 		if !ok || strings.HasPrefix(line, "#") {
@@ -244,6 +228,7 @@ func loadEnvFile(path string, wait time.Duration) {
 			os.Setenv(k, v)
 		}
 	}
+	return nil
 }
 
 func NewAI() (*AI, error) {
@@ -374,10 +359,11 @@ func (e *AI) embedMedia(req map[string]any, n int) ([][]float32, error) {
 			} `json:"data"`
 		} `json:"result"`
 	}
-	if err := e.media.cloudflareRoot(); err != nil {
+	_, run, err := e.media.cloudflareURLs()
+	if err != nil {
 		return nil, fmt.Errorf("media embeddings: %w", err)
 	}
-	if err := e.post(e.media.run+"/"+e.media.model, e.media.key, body, &res); err != nil {
+	if err := e.post(run+"/"+e.media.model, e.media.key, body, &res); err != nil {
 		return nil, fmt.Errorf("media embeddings: %w", err)
 	}
 	if !res.Success {
