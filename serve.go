@@ -54,12 +54,15 @@ func cmdServe(args []string) error {
 	lockPath := filepath.Join(dir, "jrnl.lock")
 
 	if *background {
-		// A server of another version (an upgrade, or a switch between
-		// installs) is asked to quit, and its lock awaited, so the new
-		// binary serves.
+		// An older server (an upgrade) is asked to quit, and its lock
+		// awaited, so the new binary serves.
 		if running, _, ok := runningServer(sock); ok {
 			if running == version {
 				fmt.Println("jrnl serve: already running at", sock)
+				return nil
+			}
+			if !older(running, version) {
+				fmt.Printf("jrnl serve: %s, which is newer, is already running at %s\n", running, sock)
 				return nil
 			}
 			if err := quitServer(sock, lockPath); err != nil {
@@ -95,6 +98,7 @@ func cmdServe(args []string) error {
 		return err
 	}
 
+	envWait = time.Second
 	// The embedder that wrote the journals' vectors embeds the queries. The
 	// local one is loaded, and downloaded on first use, before the socket
 	// opens; searches meanwhile find no server and do without.
@@ -186,6 +190,9 @@ type server struct {
 	// and embedding new entries for it: the server quits instead, and the
 	// next one starts with the model the settings name.
 	reconfigured func() bool
+	// settingsAt is when a refused client last made this server read its
+	// settings again; it does that at most once in 10 s.
+	settingsAt time.Time
 }
 
 // served is one project's journal and its in-memory index, rebuilt when
@@ -212,6 +219,7 @@ func newServer(ai *AI) *server {
 	})
 	sv.mux.HandleFunc("GET /search", sv.handleSearch)
 	sv.mux.HandleFunc("POST /embed", sv.handleEmbed)
+	sv.mux.HandleFunc("POST /query", sv.handleQuery)
 	go func() {
 		for range time.Tick(time.Minute) {
 			sv.mu.Lock()
@@ -436,6 +444,10 @@ var startOnce sync.Once
 // embeds the entries that waited for it.
 func startServer() {
 	startOnce.Do(func() {
+		// One of this version, or a newer one, already serves.
+		if v, _, ok := runningServer(socketPath()); ok && !older(v, version) {
+			return
+		}
 		exe, err := os.Executable()
 		if err != nil {
 			return
@@ -495,4 +507,121 @@ func serverEmbed(inputs []string) ([][]float32, bool) {
 		return nil, false
 	}
 	return vecs, true
+}
+
+// settings names what decides a search's results, keys aside: the
+// embedder, the chat model and the reranker.
+func (e *AI) settings() string {
+	extra, _ := json.Marshal(e.chatExtra)
+	return strings.Join([]string{e.embedID, e.chatURL, e.chatModel, string(extra), e.rerankURL, e.rerankModel}, "|")
+}
+
+// handleQuery runs a command's whole text search: ranking from memory under
+// the lock, then the reranker outside it, over a connection kept warm
+// between searches. It refuses a client of another version or settings
+// (409), which then searches by itself; when its own settings file has
+// moved on, the server also quits, so the next command starts a current one.
+func (sv *server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	var req query
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Q == "" || req.Project != slug(req.Project) || req.Project == "" {
+		http.Error(w, "give project and q", http.StatusBadRequest)
+		return
+	}
+	if req.Version != version {
+		http.Error(w, "this server is "+version, http.StatusConflict)
+		return
+	}
+	if req.Settings != sv.ai.settings() {
+		sv.mu.Lock()
+		check := time.Since(sv.settingsAt) > 10*time.Second
+		if check {
+			sv.settingsAt = time.Now()
+		}
+		sv.mu.Unlock()
+		if check {
+			if now, err := NewAI(); err == nil && now.settings() != sv.ai.settings() {
+				sv.stop()
+			}
+		}
+		http.Error(w, "this server has other settings", http.StatusConflict)
+		return
+	}
+	sv.mu.Lock()
+	sv.last = time.Now()
+	p, err := sv.project(req.Project)
+	var hits []Hit
+	var hasVec bool
+	var warns []string
+	if err == nil {
+		hits, hasVec, warns, err = rankHits(p.s, sv.ai, p.idx, req)
+	}
+	sv.mu.Unlock()
+	if errors.Is(err, os.ErrNotExist) {
+		http.Error(w, "no journal for "+req.Project, http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, errNoSession) {
+		// The command would fail the same way by itself: it reports
+		// this, and does not search again.
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	hits, more := finishHits(sv.ai, req, hits, hasVec)
+	json.NewEncoder(w).Encode(queryResult{Hits: hits, Warn: append(warns, more...)})
+}
+
+// serverQuery asks a running jrnl serve to run a search; ok is false when
+// none answers for this version and these settings. err is the search's
+// own failure, which the command reports.
+func serverQuery(ai *AI, req query) (res queryResult, ok bool, err error) {
+	req.Version, req.Settings = version, ai.settings()
+	body, _ := json.Marshal(req)
+	c := socketClient(socketPath())
+	c.Timeout = embedDeadline + rerankDeadline + 2*time.Second
+	r, err := c.Post("http://jrnl/query", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return res, false, nil
+	}
+	defer r.Body.Close()
+	if r.StatusCode == http.StatusUnprocessableEntity {
+		msg, _ := io.ReadAll(r.Body)
+		return res, false, errors.New(strings.TrimSpace(string(msg)))
+	}
+	if r.StatusCode != http.StatusOK || json.NewDecoder(r.Body).Decode(&res) != nil {
+		// An older server (often the one before an upgrade, which hooks
+		// keep alive) is replaced for the next command.
+		startServer()
+		return res, false, nil
+	}
+	return res, true, nil
+}
+
+// older says server version a is older than b. A build without a release
+// number (dev) is older than any release, so an installed release keeps its
+// server against a development build. A binary replaces only an older
+// server, so two installed versions never take turns replacing each other.
+func older(a, b string) bool {
+	parse := func(v string) []int {
+		var n []int
+		for _, p := range strings.Split(strings.TrimPrefix(v, "v"), ".") {
+			i, err := strconv.Atoi(p)
+			if err != nil {
+				return nil
+			}
+			n = append(n, i)
+		}
+		return n
+	}
+	na, nb := parse(a), parse(b)
+	switch {
+	case nb == nil:
+		return false
+	case na == nil:
+		return true
+	}
+	return slices.Compare(na, nb) < 0
 }

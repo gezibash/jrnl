@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -171,9 +172,10 @@ func filterFlags(fs *flag.FlagSet) (*Filter, *int) {
 }
 
 // resolveFilter turns --session last into the previous session's ID.
-func resolveFilter(s *Store, f *Filter) error {
+// me is the caller's own session, which "last" skips.
+func resolveFilter(s *Store, f *Filter, me string) error {
 	if f.Session == "last" {
-		id, err := s.LastSession(os.Getenv("CLAUDE_CODE_SESSION_ID"))
+		id, err := s.LastSession(me)
 		if err != nil {
 			return err
 		}
@@ -560,7 +562,7 @@ func cmdList(args []string) error {
 		return err
 	}
 	defer s.Close()
-	if err := resolveFilter(s, f); err != nil {
+	if err := resolveFilter(s, f, os.Getenv("CLAUDE_CODE_SESSION_ID")); err != nil {
 		return err
 	}
 	es, err := s.List(*f, *limit, *oldest)
@@ -610,7 +612,7 @@ func cmdStats(args []string) error {
 		return err
 	}
 	defer s.Close()
-	if err := resolveFilter(s, f); err != nil {
+	if err := resolveFilter(s, f, os.Getenv("CLAUDE_CODE_SESSION_ID")); err != nil {
 		return err
 	}
 	total, first, last, by, err := s.Stats(*f)
@@ -646,116 +648,153 @@ func cmdSearch(args []string) error {
 	if err != nil {
 		return err
 	}
-	q := strings.TrimSpace(strings.Join(pos, " "))
-	if q == "" && *like == "" {
+	req := query{Q: strings.TrimSpace(strings.Join(pos, " ")), Filter: *f, Limit: *limit, Fast: *fast,
+		MinScore: *minScore, Me: os.Getenv("CLAUDE_CODE_SESSION_ID")}
+	if req.Q == "" && *like == "" {
 		return fmt.Errorf("search: give a query, or --like FILE")
 	}
-	order := ""
 	switch {
 	case *newest && *oldest:
 		return fmt.Errorf("search: pick one of --newest and --oldest")
 	case *newest:
-		order = "newest"
+		req.Order = "newest"
 	case *oldest:
-		order = "oldest"
+		req.Order = "oldest"
 	}
-	s, _, err := open(*project, false)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	if err := resolveFilter(s, f); err != nil {
-		return err
-	}
-	var qvec []float32
 	ai, err := NewAI()
 	if err != nil {
 		return err
 	}
-	// Text queries rank entry text and attachment descriptions. --like ranks
-	// media of the same kind by their vectors when a media embedder is set
-	// up (vectors compare well within one modality, not across them).
-	// Without one, it describes the file the way attachments are described
-	// and ranks the descriptions most like it.
-	in, modalities, embedder := Input{Text: q, Query: true}, []string{"text", "caption"}, ai.embedID
-	client := ai.Interactive(embedDeadline)
 	if *like != "" {
-		a := Asset{Path: *like, Name: filepath.Base(*like), Mime: mediaTypes[strings.ToLower(filepath.Ext(*like))]}
-		if a.Modality() == "" {
-			return fmt.Errorf("--like needs an image, video or audio file")
-		}
-		if ai.mediaErr == nil {
-			in, modalities, embedder = Input{File: a.Path, Mime: a.Mime}, []string{a.Modality()}, ai.mediaID
-		} else {
-			desc, err := ai.Describe(a)
-			if err != nil {
-				return fmt.Errorf("--like: %w", err)
-			}
-			in, modalities = captionInput(a.Name, "", desc), []string{"caption"}
-		}
-		q, client = "", ai
+		return searchLike(ai, *project, *like, req)
 	}
-	vecs, aiErr := client.Embed([]Input{in})
-	if aiErr == nil {
-		qvec = vecs[0]
+	// A running jrnl serve answers from memory, and keeps the reranker's
+	// connection warm: the TLS handshake alone took 350-520 ms here.
+	req.Project = *project
+	if req.Project == "" {
+		req.Project = detectGit().project
 	}
-	if aiErr != nil {
-		if *like != "" {
-			return aiErr
-		}
-		// Without embeddings set up, keyword search is how jrnl works; hits are
-		// marked (keyword). Say so only when it finds nothing.
-		if !awaitingSetup(s, aiErr) {
-			fmt.Fprintf(os.Stderr, "jrnl: keyword search only: %v\n", aiErr)
-		}
+	if _, err := os.Stat(filepath.Join(journalHome(), req.Project, "journal.db")); err != nil {
+		return noJournal{req.Project}
 	}
-	// One ranking for every text search, the one jrnl serve answers from:
-	// the journal's words and vectors, read into memory (about 8 ms per
-	// 1,000 entries).
-	var cands []candidate
-	if *like != "" {
-		cands, err = nearest(qvec, s.chunkVecs(embedder, modalities, *f))
-	} else {
-		var idx *memIndex
-		var only map[string]bool
-		if idx, err = buildMemIndex(s, embedder); err == nil {
-			if only, err = s.allowed(*f); err == nil {
-				cands = idx.rank(q, qvec, only, order)
-			}
-		}
-	}
-	if err != nil {
+	if err := req.Filter.pinDates(); err != nil {
 		return err
 	}
-	if *fast && *like == "" && order == "" {
-		g := gateFor(ai.embedModel)
-		if *minScore >= 0 {
-			g = gate{float32(*minScore), float32(*minScore)}
-		}
-		cands = gateCut(cands, qvec != nil, g, *limit)
-	}
-	hits, err := s.hits(cands, q)
-	if err != nil {
+	if res, ok, err := serverQuery(ai, req); err != nil {
 		return err
-	}
-	if *fast && *like == "" && order == "" {
-		printHits(os.Stdout, hits)
+	} else if ok {
+		printWarnings(res.Warn)
+		printHits(os.Stdout, res.Hits)
 		return nil
 	}
+	// No server: the same ranking, from the journal read into memory
+	// (about 8 ms per 1,000 entries).
+	s, err := Open(req.Project)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	idx, err := buildMemIndex(s, ai.embedID)
+	if err != nil {
+		return err
+	}
+	hits, hasVec, warns, err := rankHits(s, ai, idx, req)
+	if err != nil {
+		return err
+	}
+	hits, w := finishHits(ai, req, hits, hasVec)
+	printWarnings(append(warns, w...))
+	printHits(os.Stdout, hits)
+	return nil
+}
+
+// query is one text search, as a command sends it to jrnl serve.
+type query struct {
+	// The client's version and settings: a server answers only when they
+	// match its own, so a stale server never ranks with other settings.
+	Version, Settings string
+	Project, Q        string
+	Filter            Filter
+	Limit             int
+	Order             string // "", newest or oldest
+	Fast              bool
+	MinScore          float64
+	Me                string // the caller's session, for --session last
+}
+
+type queryResult struct {
+	Hits []Hit
+	Warn []string
+}
+
+func printWarnings(warns []string) {
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, "jrnl: "+w)
+	}
+}
+
+// rankHits embeds the question and ranks the journal: everything that
+// reads the store. The rest of a search (finishHits) needs no store, so jrnl
+// serve runs it outside its lock.
+func rankHits(s *Store, ai *AI, idx *memIndex, r query) (hits []Hit, hasVec bool, warns []string, err error) {
+	f := r.Filter
+	if err := resolveFilter(s, &f, r.Me); err != nil {
+		return nil, false, nil, err
+	}
+	var qvec []float32
+	vecs, aiErr := ai.Interactive(embedDeadline).Embed([]Input{{Text: r.Q, Query: true}})
+	if aiErr == nil {
+		qvec = vecs[0]
+	} else if !awaitingSetup(s, aiErr) {
+		// Without embeddings set up, keyword search is how jrnl works; hits
+		// are marked (keyword). Say so only when it finds nothing.
+		warns = append(warns, fmt.Sprintf("keyword search only: %v", aiErr))
+	}
+	only, err := s.allowed(f)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	cands := idx.rank(r.Q, qvec, only, r.Order)
+	fast := r.Fast && r.Order == ""
+	if fast {
+		g := gateFor(ai.embedModel)
+		if r.MinScore >= 0 {
+			g = gate{float32(r.MinScore), float32(r.MinScore)}
+		}
+		cands = gateCut(cands, qvec != nil, g, r.Limit)
+	}
+	if hits, err = s.hits(cands, r.Q); err != nil {
+		return nil, false, nil, err
+	}
+	if fast {
+		return hits, qvec != nil, warns, nil
+	}
 	if len(hits) == 0 && aiErr != nil && awaitingSetup(s, aiErr) {
-		fmt.Fprintln(os.Stderr, "jrnl: no keyword match; search by meaning is off (see `jrnl doctor`)")
+		warns = append(warns, "no keyword match; search by meaning is off (see `jrnl doctor`)")
 	}
-	if qvec != nil && *minScore > 0 {
-		hits = slices.DeleteFunc(hits, func(h Hit) bool { return float64(h.Sim) < *minScore })
+	if qvec != nil && r.MinScore > 0 {
+		hits = slices.DeleteFunc(hits, func(h Hit) bool { return float64(h.Sim) < r.MinScore })
 	}
-	if qvec != nil && q != "" && len(hits) > 1 {
-		k := min(*limit, 20)
-		if order != "" {
+	return hits, qvec != nil, warns, nil
+}
+
+// finishHits reranks, orders and cuts ranked hits.
+func finishHits(ai *AI, r query, hits []Hit, hasVec bool) ([]Hit, []string) {
+	if r.Fast && r.Order == "" {
+		return hits, nil
+	}
+	var warns []string
+	if hasVec && r.Q != "" && len(hits) > 1 {
+		k := min(r.Limit, 20)
+		if r.Order != "" {
 			k = 0 // every relevant entry; sorted by date below
 		}
-		hits = rerank(ai.Interactive(rerankDeadline), q, hits, k)
+		var w string
+		if hits, w = rerank(ai.Interactive(rerankDeadline), r.Q, hits, k); w != "" {
+			warns = append(warns, w)
+		}
 	}
-	if order != "" {
+	if r.Order != "" {
 		// The reranker's picks are the relevant ones; show them in date
 		// order. Without a reranker, all candidates in date order.
 		var picked []Hit
@@ -768,15 +807,61 @@ func cmdSearch(args []string) error {
 			hits = picked
 		}
 		sort.SliceStable(hits, func(i, j int) bool {
-			if order == "oldest" {
+			if r.Order == "oldest" {
 				return hits[i].Entry.TS < hits[j].Entry.TS
 			}
 			return hits[i].Entry.TS > hits[j].Entry.TS
 		})
 	}
-	if len(hits) > *limit {
-		hits = hits[:*limit]
+	if len(hits) > r.Limit {
+		hits = hits[:r.Limit]
 	}
+	return hits, warns
+}
+
+// searchLike finds attachments like a file. --like ranks media of the same
+// kind by their vectors when a media embedder is set up (vectors compare
+// well within one modality, not across them). Without one, it describes the
+// file the way attachments are described and ranks the descriptions most
+// like it.
+func searchLike(ai *AI, project, like string, r query) error {
+	s, _, err := open(project, false)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	if err := resolveFilter(s, &r.Filter, r.Me); err != nil {
+		return err
+	}
+	a := Asset{Path: like, Name: filepath.Base(like), Mime: mediaTypes[strings.ToLower(filepath.Ext(like))]}
+	if a.Modality() == "" {
+		return fmt.Errorf("--like needs an image, video or audio file")
+	}
+	in, modalities, embedder := Input{File: a.Path, Mime: a.Mime}, []string{a.Modality()}, ai.mediaID
+	if ai.mediaErr != nil {
+		desc, err := ai.Describe(a)
+		if err != nil {
+			return fmt.Errorf("--like: %w", err)
+		}
+		in, modalities, embedder = captionInput(a.Name, "", desc), []string{"caption"}, ai.embedID
+	}
+	vecs, err := ai.Embed([]Input{in})
+	if err != nil {
+		return err
+	}
+	cands, err := nearest(vecs[0], s.chunkVecs(embedder, modalities, r.Filter))
+	if err != nil {
+		return err
+	}
+	hits, err := s.hits(cands, "")
+	if err != nil {
+		return err
+	}
+	if r.MinScore > 0 {
+		hits = slices.DeleteFunc(hits, func(h Hit) bool { return float64(h.Sim) < r.MinScore })
+	}
+	r.Q, r.Fast = "", false
+	hits, _ = finishHits(ai, r, hits, true)
 	printHits(os.Stdout, hits)
 	return nil
 }
@@ -880,18 +965,24 @@ func git(args ...string) string {
 }
 
 // detectGit names the project after its origin remote, so every worktree and
-// clone of one repository shares a journal. A plain repository is read from
-// its .git directory: each git process costs 70-180 ms on a Mac with
-// endpoint security, three of them per command. Anything else (a worktree or
-// submodule, whose .git is a file) asks git.
+// clone of one repository shares a journal. It reads .git itself: each git
+// process costs 70-180 ms on a Mac with endpoint security, three of them per
+// command. A .git file (a linked worktree or a submodule) points at the
+// repository's git directory. Only what it can't read falls back to git.
 func detectGit() gitInfo {
 	wd, _ := os.Getwd()
 	for dir := wd; ; dir = filepath.Dir(dir) {
-		st, err := os.Stat(filepath.Join(dir, ".git"))
-		if err == nil && st.IsDir() {
-			return readGitDir(dir)
+		gd := filepath.Join(dir, ".git")
+		if st, err := os.Stat(gd); err == nil {
+			if st.IsDir() {
+				return readGitDir(dir, gd, gd)
+			}
+			if gd, common, ok := linkedGitDir(dir, gd); ok {
+				return readGitDir(dir, gd, common)
+			}
+			break
 		}
-		if err == nil || filepath.Dir(dir) == dir {
+		if filepath.Dir(dir) == dir {
 			break
 		}
 	}
@@ -906,12 +997,39 @@ func detectGit() gitInfo {
 	return g
 }
 
-// readGitDir reads the origin URL, branch and commit of the repository at
-// top from its .git directory.
-func readGitDir(top string) gitInfo {
-	gd := filepath.Join(top, ".git")
+// linkedGitDir follows a .git file ("gitdir: <path>") to the worktree's own
+// git directory, and its commondir file to the directory shared by every
+// worktree, which holds config and refs. A submodule has no commondir.
+func linkedGitDir(top, file string) (gd, common string, ok bool) {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return "", "", false
+	}
+	gd, ok = strings.CutPrefix(strings.TrimSpace(string(b)), "gitdir: ")
+	if !ok {
+		return "", "", false
+	}
+	if !filepath.IsAbs(gd) {
+		gd = filepath.Join(top, gd)
+	}
+	common = gd
+	if c, err := os.ReadFile(filepath.Join(gd, "commondir")); err == nil {
+		common = strings.TrimSpace(string(c))
+		if !filepath.IsAbs(common) {
+			common = filepath.Join(gd, common)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(gd, "HEAD")); err != nil {
+		return "", "", false
+	}
+	return gd, common, true
+}
+
+// readGitDir reads the origin URL, branch and commit of the checkout at top:
+// HEAD from its git directory gd, config and refs from common.
+func readGitDir(top, gd, common string) gitInfo {
 	g := gitInfo{project: slug(filepath.Base(top))}
-	if url := originURL(gd); url != "" {
+	if url := originURL(common); url != "" {
 		g.project = slugFromRemote(url)
 	}
 	head, _ := os.ReadFile(filepath.Join(gd, "HEAD"))
@@ -919,7 +1037,9 @@ func readGitDir(top string) gitInfo {
 	sha := ref
 	if isRef {
 		g.branch = strings.TrimPrefix(ref, "refs/heads/")
-		sha = resolveRef(gd, ref)
+		if sha = resolveRef(gd, ref); sha == "" && common != gd {
+			sha = resolveRef(common, ref)
+		}
 	}
 	if len(sha) >= 7 {
 		g.commit = sha[:7]
@@ -1021,7 +1141,7 @@ func isTerminal(f *os.File) bool {
 // "reranked", then the rest in fused order. If the call fails, the fused
 // order stands.
 // k is how many best entries to ask for; 0 asks for every relevant one.
-func rerank(ai *AI, q string, hits []Hit, k int) []Hit {
+func rerank(ai *AI, q string, hits []Hit, k int) ([]Hit, string) {
 	// Entries with identical text are shown to the reranker once.
 	var items []string
 	var itemHit []int
@@ -1041,15 +1161,13 @@ func rerank(ai *AI, q string, hits []Hit, k int) []Hit {
 	}
 	order, err := ai.Rerank(q, items, k)
 	if errors.Is(err, errNoChat) {
-		return hits // not set up; `jrnl doctor` says so
+		return hits, "" // not set up; `jrnl doctor` says so
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "jrnl: not reranked: %v\n", err)
-		return hits
+		return hits, fmt.Sprintf("not reranked: %v", err)
 	}
 	if len(order) == 0 {
-		fmt.Fprintln(os.Stderr, "jrnl: no entry clearly answers this; showing the closest matches")
-		return hits
+		return hits, "no entry clearly answers this; showing the closest matches"
 	}
 	out := make([]Hit, 0, len(hits))
 	picked := map[int]bool{}
@@ -1065,7 +1183,7 @@ func rerank(ai *AI, q string, hits []Hit, k int) []Hit {
 			out = append(out, h)
 		}
 	}
-	return out
+	return out, ""
 }
 
 func cmdClose(args []string) error {
@@ -1194,6 +1312,13 @@ func cmdDoctor(args []string) error {
 		fmt.Printf("%-10s %d vector(s) from %s, which is not set up now; `jrnl reindex --prune` deletes them\n", "", u.N, u.Key)
 	}
 	row("basics", true, "add, list, show, keyword search, stats, close", "")
+	if p, err := exec.LookPath("jrnl"); err == nil {
+		if isMiseShim(p) {
+			fmt.Printf("%-10s %s is a mise shim: it runs mise before every call (100-300 ms).\n", "speed", p)
+			fmt.Printf("%-10s      put the real binary on PATH: mise settings set activate_shims false,\n", "")
+			fmt.Printf("%-10s      and mise activate in your shell (see the README)\n", "")
+		}
+	}
 
 	// where says which setting chose a role, when it wasn't a default.
 	where := func(role string) string {
@@ -1220,10 +1345,15 @@ func cmdDoctor(args []string) error {
 			ai.rerankModel+" at "+ai.rerankURL+where("rerank"))
 	}
 	how = "[media_embed] with a cloudflare provider in config.toml; until then --like compares descriptions"
-	if ai.mediaErr == nil {
-		how = ai.media.model + " at " + ai.media.run + where("media_embed")
+	mediaOn := ai.mediaErr == nil
+	if mediaOn {
+		if _, run, err := ai.media.cloudflareURLs(); err != nil {
+			mediaOn, how = false, err.Error()
+		} else {
+			how = ai.media.model + " at " + run + where("media_embed")
+		}
 	}
-	row("--like", ai.mediaErr == nil, "find attachments that look or sound alike", how)
+	row("--like", mediaOn, "find attachments that look or sound alike", how)
 	_, ffErr := exec.LookPath("ffmpeg")
 	how = ""
 	if ffErr != nil {
@@ -1276,3 +1406,27 @@ func embedStatus(ai *AI) (bool, string) {
 	}
 	return false, err.Error()
 }
+
+// isMiseShim says the jrnl at p runs mise first: a link to the mise binary,
+// or a script that calls it.
+func isMiseShim(p string) bool {
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return false
+	}
+	if filepath.Base(real) == "mise" {
+		return true
+	}
+	f, err := os.Open(real)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head := make([]byte, 512)
+	n, _ := io.ReadFull(f, head)
+	return strings.HasPrefix(string(head[:n]), "#!") && miseCommand.Match(head[:n])
+}
+
+// miseCommand is a call to the mise binary: "mise x", "/path/to/mise exec",
+// not a path through mise's install folder.
+var miseCommand = regexp.MustCompile(`(^|[\s/"'])mise(\s|["']|$)`)

@@ -16,7 +16,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -108,14 +107,16 @@ func format(model string, in Input) string {
 //   - a reranker with a Cohere-style /rerank API.
 //   - media vectors (search --like by look): Cloudflare Workers AI's own API.
 type AI struct {
-	embedURL, embedKey, embedModel, embedID string
-	embedSet                                bool // set by config or JRNL_EMBED_URL, not a default
+	embedURL, embedModel, embedID string
+	embedKey                      secret
+	embedSet                      bool // set by config or JRNL_EMBED_URL, not a default
 	// local: no embeddings API is set up, so bge-small runs in this process,
 	// or in a running jrnl serve (serving: this is that server).
 	// download: this command may download its model (reindex, serve).
 	local, download, serving bool
 
-	chatURL, chatKey, chatModel string
+	chatURL, chatModel string
+	chatKey            secret
 
 	// Vectors of the raw images, video and audio, for search --like. Only
 	// Cloudflare Workers AI is supported; without it, --like compares
@@ -127,9 +128,10 @@ type AI struct {
 	from map[string]string // role: where it was set, for jrnl doctor
 
 	// A dedicated reranker with a Cohere-style /rerank API, optional.
-	rerankURL, rerankKey, rerankModel string
-	chatExtra                         map[string]any // merged into each chat request
-	chatErr                           error          // set when no chat API is set up
+	rerankURL, rerankModel string
+	rerankKey              secret
+	chatExtra              map[string]any // merged into each chat request
+	chatErr                error          // set when no chat API is set up
 
 	hc       *http.Client
 	attempts int
@@ -141,10 +143,19 @@ type AI struct {
 // fallback instead of waiting.
 func (e *AI) Interactive(deadline time.Duration) *AI {
 	c := *e
-	c.hc = &http.Client{Timeout: deadline}
+	c.hc = &http.Client{Timeout: deadline, Transport: apiTransport}
 	c.attempts = 1
 	return &c
 }
+
+// apiTransport keeps connections to the model APIs open between searches:
+// jrnl serve reranks every few minutes, and a new TLS handshake cost
+// 350-520 ms here. Go's default drops them after 90 s idle.
+var apiTransport = func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.IdleConnTimeout = 10 * time.Minute
+	return t
+}()
 
 // NewAI reads its settings from the environment:
 //
@@ -156,7 +167,7 @@ func (e *AI) Interactive(deadline time.Duration) *AI {
 //	JRNL_CHAT_EXTRA                                   JSON fields added to each chat request
 //	JRNL_RERANK_URL, JRNL_RERANK_KEY, JRNL_RERANK_MODEL  a reranker with a
 //	    Cohere-style /rerank API (Cohere, Voyage, Jina, Vercel AI Gateway)
-//	JRNL_ENV_FILE                                     more of these settings (see envFile)
+//	JRNL_ENV_FILE                                     keys and other values these name, read when missing (see envVar)
 
 // ollamaURL is the OpenAI-compatible API of Ollama at OLLAMA_HOST.
 func ollamaURL() string {
@@ -181,45 +192,29 @@ func envFile() string {
 	return filepath.Join(home, ".config", "jrnl", ".env")
 }
 
-// loadEnvFile sets each KEY=VALUE from the file that the environment does
-// not already set. A missing file is fine. A named pipe whose writer does not
-// answer within wait (1Password closed, or its prompt not yet approved) is
-// skipped with a warning, so jrnl still saves entries, without the keys.
-func loadEnvFile(path string, wait time.Duration) {
+// readEnvFile sets each KEY=VALUE from the file that the environment does
+// not already set. A missing file is fine. A named pipe blocks until its
+// writer answers (1Password unlocked and its prompt approved); loadEnv
+// decides how long a command waits for that.
+func readEnvFile(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
-		return
+		return nil
 	}
 	pipe := info.Mode()&os.ModeNamedPipe != 0
-	type result struct {
-		data []byte
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		// 1Password serves one reader at a time: of 5 jrnl processes reading
-		// at once, 2 got an empty file. An empty pipe is read again.
-		var data []byte
-		var err error
-		for i := range 20 {
-			if data, err = os.ReadFile(path); err != nil || !pipe || len(bytes.TrimSpace(data)) > 0 {
-				break
-			}
-			time.Sleep(time.Duration(25*(i+1)) * time.Millisecond)
+	// 1Password serves one reader at a time: of 5 jrnl processes reading
+	// at once, 2 got an empty file. An empty pipe is read again.
+	var data []byte
+	for i := range 20 {
+		if data, err = os.ReadFile(path); err != nil || !pipe || len(bytes.TrimSpace(data)) > 0 {
+			break
 		}
-		done <- result{data, err}
-	}()
-	var r result
-	select {
-	case r = <-done:
-	case <-time.After(wait):
-		r.err = fmt.Errorf("no answer in %v; is 1Password unlocked, and was its prompt approved?", wait)
+		time.Sleep(time.Duration(25*(i+1)) * time.Millisecond)
 	}
-	if r.err != nil {
-		fmt.Fprintf(os.Stderr, "jrnl: skipped %s: %v\n", path, r.err)
-		return
+	if err != nil {
+		return err
 	}
-	for _, line := range strings.Split(string(r.data), "\n") {
+	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
 		k, v, ok := strings.Cut(line, "=")
 		if !ok || strings.HasPrefix(line, "#") {
@@ -233,13 +228,11 @@ func loadEnvFile(path string, wait time.Duration) {
 			os.Setenv(k, v)
 		}
 	}
+	return nil
 }
 
-var loadEnvOnce sync.Once
-
 func NewAI() (*AI, error) {
-	loadEnvOnce.Do(func() { loadEnvFile(envFile(), 10*time.Second) })
-	e := &AI{hc: &http.Client{Timeout: 3 * time.Minute}, attempts: 4, from: map[string]string{}}
+	e := &AI{hc: &http.Client{Timeout: 3 * time.Minute, Transport: apiTransport}, attempts: 4, from: map[string]string{}}
 	c, err := loadConfig(configFile())
 	if err != nil {
 		return nil, err
@@ -265,8 +258,11 @@ func NewAI() (*AI, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := chat.cloudflareRoot(); err != nil {
+		e.chatErr = fmt.Errorf("chat: %w", err)
+	}
 	e.chatURL, e.chatKey, e.chatModel, e.chatExtra, e.from["chat"] = chat.url, chat.key, chat.model, chat.extra, chat.from
-	if e.chatURL == "" {
+	if e.chatURL == "" && e.chatErr == nil {
 		e.chatErr = errNoChat
 	}
 	if x := os.Getenv("JRNL_CHAT_EXTRA"); x != "" {
@@ -285,7 +281,7 @@ func NewAI() (*AI, error) {
 	if e.media, err = c.resolve("media_embed", c.MediaEmbed, ""); err != nil {
 		return nil, err
 	}
-	if e.media.run == "" {
+	if e.media.kind == "" {
 		e.mediaErr = errNoMediaEmbed
 	} else {
 		// Workers AI gives the same vectors on any account.
@@ -363,7 +359,11 @@ func (e *AI) embedMedia(req map[string]any, n int) ([][]float32, error) {
 			} `json:"data"`
 		} `json:"result"`
 	}
-	if err := e.post(e.media.run+"/"+e.media.model, e.media.key, body, &res); err != nil {
+	_, run, err := e.media.cloudflareURLs()
+	if err != nil {
+		return nil, fmt.Errorf("media embeddings: %w", err)
+	}
+	if err := e.post(run+"/"+e.media.model, e.media.key, body, &res); err != nil {
 		return nil, fmt.Errorf("media embeddings: %w", err)
 	}
 	if !res.Success {
@@ -468,7 +468,8 @@ type unreachable struct{ error }
 // post sends JSON to an API and decodes the reply. It retries rate limits,
 // server errors and network failures with backoff, so a burst from many
 // parallel sessions slows down instead of failing.
-func (e *AI) post(url, key string, body []byte, out any) error {
+func (e *AI) post(url string, sk secret, body []byte, out any) error {
+	key := sk.get()
 	var last error
 	for attempt := 0; attempt < e.attempts; attempt++ {
 		if attempt > 0 {

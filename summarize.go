@@ -52,7 +52,7 @@ func cmdSummarize(args []string) error {
 		return err
 	}
 	defer s.Close()
-	if err := resolveFilter(s, f); err != nil {
+	if err := resolveFilter(s, f, os.Getenv("CLAUDE_CODE_SESSION_ID")); err != nil {
 		return err
 	}
 	ai, err := NewAI()

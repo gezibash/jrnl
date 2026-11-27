@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -1347,16 +1348,124 @@ func TestKeysFromEnvFile(t *testing.T) {
 }
 
 // A mounted pipe that nobody answers (1Password closed or its prompt not
-// approved) must not hang jrnl.
+// approved) must not hang jrnl, nor leave a blocked reader behind for each
+// try; and a prompt approved after jrnl stopped waiting still delivers the
+// keys, which a long-running jrnl serve needs.
 func TestEnvFileWithoutWriter(t *testing.T) {
 	pipe := filepath.Join(t.TempDir(), ".env")
 	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("JRNL_ENV_FILE", pipe)
+	os.Unsetenv("JRNL_LATE_KEY")
+	t.Cleanup(func() { os.Unsetenv("JRNL_LATE_KEY") })
+	oldWait, oldRetry := envWait, envRetry
+	envWait, envRetry, envDone = 100*time.Millisecond, 0, time.Time{}
+	t.Cleanup(func() {
+		envMu.Lock()
+		defer envMu.Unlock()
+		envWait, envRetry, envDone = oldWait, oldRetry, time.Time{}
+	})
+
+	before := runtime.NumGoroutine()
 	start := time.Now()
-	loadEnvFile(pipe, 200*time.Millisecond)
+	for range 5 {
+		loadEnv()
+	}
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("waited %v for a pipe with no writer", d)
+	}
+	if n := runtime.NumGoroutine() - before; n > 1 {
+		t.Errorf("%d readers left blocked on the pipe; want at most 1", n)
+	}
+
+	w, err := os.OpenFile(pipe, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.WriteString("JRNL_LATE_KEY=late\n")
+	w.Close()
+	for range 50 {
+		if os.Getenv("JRNL_LATE_KEY") != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := os.Getenv("JRNL_LATE_KEY"); got != "late" {
+		t.Errorf("a key written after jrnl stopped waiting was lost: got %q", got)
+	}
+}
+
+// The env file is read only for a value jrnl needs and lacks. With every key
+// in the environment, a pipe nobody answers costs nothing: before, each
+// command waited 10 s for it and warned.
+func TestEnvFileReadOnlyWhenNeeded(t *testing.T) {
+	e := newEnv(t)
+	pipe := filepath.Join(t.TempDir(), ".env")
+	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.extra = []string{"JRNL_ENV_FILE=" + pipe}
+	for _, args := range [][]string{{"add"}, {"search", "Login"}, {"list"}} {
+		start := time.Now()
+		_, errOut, err := e.run("Login form rejects valid credentials.", args...)
+		if err != nil || strings.Contains(errOut, "skipped") || time.Since(start) > 5*time.Second {
+			t.Errorf("%v: %v after %v, stderr %q", args, err, time.Since(start), errOut)
+		}
+	}
+}
+
+// A role whose Cloudflare account variable is unset is off; everything else
+// still works. Before, search and doctor failed with "set account".
+func TestCloudflareAccountUnset(t *testing.T) {
+	e := newEnv(t)
+	e.config = `
+[providers.cf]
+type    = "cloudflare"
+account = "env:JRNL_TEST_NO_ACCOUNT"
+key     = "env:JRNL_TEST_CF_KEY"
+
+[media_embed]
+provider = "cf"
+model    = "@cf/google/embeddinggemma-2"
+`
+	e.must("Login form rejects valid credentials.", "add")
+	if out := e.must("", "search", "Login"); !strings.Contains(out, "Login form") {
+		t.Errorf("search should still find the entry:\n%s", out)
+	}
+	if out := e.must("", "doctor"); !strings.Contains(out, "JRNL_TEST_NO_ACCOUNT") {
+		t.Errorf("doctor should name the unset account variable:\n%s", out)
+	}
+}
+
+// doctor says when the jrnl on PATH is a mise shim: every call through one
+// runs mise first, 140-330 ms on a Mac with endpoint security.
+func TestDoctorFindsMiseShim(t *testing.T) {
+	e := newEnv(t)
+	dir := t.TempDir()
+	mise := filepath.Join(dir, "mise")
+	os.WriteFile(mise, []byte("#!/bin/sh\n"), 0o755)
+	shims := filepath.Join(dir, "shims")
+	os.Mkdir(shims, 0o755)
+	os.Symlink(mise, filepath.Join(shims, "jrnl"))
+	e.path = shims
+	if out := e.must("", "doctor"); !strings.Contains(out, "mise shim") {
+		t.Errorf("doctor should warn about the shim:\n%s", out)
+	}
+	os.Remove(filepath.Join(shims, "jrnl"))
+	os.WriteFile(filepath.Join(shims, "jrnl"), []byte("#!/bin/sh\nexec mise x -- jrnl \"$@\"\n"), 0o755)
+	if out := e.must("", "doctor"); !strings.Contains(out, "mise shim") {
+		t.Errorf("doctor should warn about a script shim:\n%s", out)
+	}
+	os.Remove(filepath.Join(shims, "jrnl"))
+	os.WriteFile(filepath.Join(shims, "jrnl"), []byte("#!/bin/sh\nexec "+dir+"/mise/installs/jrnl/4.0.2/jrnl \"$@\"\n"), 0o755)
+	if out := e.must("", "doctor"); strings.Contains(out, "mise shim") {
+		t.Errorf("a script that runs the installed binary is no shim:\n%s", out)
+	}
+	os.Remove(filepath.Join(shims, "jrnl"))
+	os.Symlink(bin, filepath.Join(shims, "jrnl"))
+	if out := e.must("", "doctor"); strings.Contains(out, "mise shim") {
+		t.Errorf("a real binary on PATH is no shim:\n%s", out)
 	}
 }
 
@@ -1393,6 +1502,12 @@ extra    = { reasoning_effort = "low", kwargs = { thinking = false } }
 	}
 	if got := lastChat("JRNL_CHAT_URL="+e.url+"/v1", "JRNL_CHAT_MODEL=env/model"); got["auth"] == "Bearer k-conf" {
 		t.Errorf("the config's key went to the URL set by JRNL_CHAT_URL: %v", got)
+	}
+	// JRNL_CHAT_KEY from the env file still replaces the provider's key.
+	envFile := filepath.Join(t.TempDir(), ".env")
+	os.WriteFile(envFile, []byte("JRNL_CHAT_KEY=k-file\n"), 0o600)
+	if got := lastChat("JRNL_ENV_FILE=" + envFile); got["auth"] != "Bearer k-file" {
+		t.Errorf("JRNL_CHAT_KEY in the env file should win over the provider's key, got %v", got["auth"])
 	}
 
 	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL="} // the config's embedder, not the test default
@@ -1543,6 +1658,23 @@ func TestProjectBranchAndCommitFromGit(t *testing.T) {
 	out = e.must("", "show", firstID(e.must("detached", "add")))
 	if strings.Contains(out, "branch:") || !strings.Contains(out, "commit: "+want+"\n") {
 		t.Errorf("detached HEAD should record the commit and no branch:\n%s", out)
+	}
+
+	// A linked worktree, whose .git is a file: same journal, its own branch,
+	// a commit whose ref is loose in the main repository's refs.
+	wt := filepath.Join(t.TempDir(), "wt")
+	gitc("worktree", "add", "-q", "-b", "wt/branch", wt)
+	gitc("-C", wt, "commit", "-q", "--allow-empty", "-m", "two")
+	wantWT := gitc("-C", wt, "rev-parse", "--short=7", "HEAD")
+	e.dir = wt
+	if out := e.must("", "where"); !strings.HasSuffix(strings.TrimSpace(out), "acme-widget") {
+		t.Errorf("worktree: where = %q, want the origin slug acme-widget", out)
+	}
+	out = e.must("", "show", firstID(e.must("in a worktree", "add")))
+	for _, line := range []string{`branch: "wt/branch"`, "commit: " + wantWT} {
+		if !strings.Contains(out, line+"\n") {
+			t.Errorf("worktree: show is missing %q:\n%s", line, out)
+		}
 	}
 }
 
@@ -1823,6 +1955,45 @@ func TestServeOneServerOfTheCurrentVersion(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Error("the older server is still running after the upgrade")
 	}
+
+	// An older binary leaves the newer server alone, by its search or its
+	// serve --background (hooks run either): two installed versions must
+	// not take turns replacing each other, each reloading the model. A
+	// build without a release number (dev) counts as the oldest.
+	for _, args := range [][]string{{"add", "Login form rejects valid credentials.", "--project", "t"}, {"search", "--fast", "Login", "--project", "t"}, {"serve", "--background"}} {
+		c := exec.Command(bin, args...)
+		c.Env = env
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	time.Sleep(2 * time.Second)
+	if got := health(); !strings.HasPrefix(got, "jrnl 9.9.9 ") {
+		t.Errorf("an older binary replaced the newer server: health %q", got)
+	}
+
+	// A search by a newer binary gets a server of its version for the next
+	// command: hooks keep an old server alive, so otherwise an upgrade
+	// never reaches the fast path.
+	socketClient(sock).Post("http://jrnl/quit", "", nil)
+	for range 100 {
+		if health() == "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	old := exec.Command(bin, "serve", "--background")
+	old.Env = env
+	if out, err := old.CombinedOutput(); err != nil {
+		t.Fatalf("serve --background: %v\n%s", err, out)
+	}
+	waitFor("jrnl dev ")
+	c := exec.Command(newer, "search", "--fast", "Login", "--project", "t")
+	c.Env = env
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("search by 9.9.9: %v\n%s", err, out)
+	}
+	waitFor("jrnl 9.9.9 ")
 	t.Cleanup(func() { socketClient(sock).Post("http://jrnl/quit", "", nil) })
 }
 
@@ -1920,6 +2091,86 @@ func localTestAI(t testing.TB) *AI {
 func serveEnv(home string) []string {
 	return append(os.Environ(), "JRNL_HOME="+home, "JRNL_CONFIG="+filepath.Join(home, "no-config.toml"),
 		"JRNL_ENV_FILE="+filepath.Join(home, "no-env"), "JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR="+localDir())
+}
+
+// jrnl search hands the whole search, reranking included, to a running jrnl
+// serve: the reranker sees the server's key, not the command's. A command
+// whose settings differ searches by itself, and the server stays up.
+func TestSearchRunsInServer(t *testing.T) {
+	needLocalModel(t)
+	e := newEnv(t)
+	home, err := os.MkdirTemp("/tmp", "jrq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	e.home = home
+	quitServerAt(t, home)
+	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + localDir(), "JRNL_CHAT_KEY=client-key"}
+
+	// Started first, so the adds embed through it instead of starting one
+	// with the command's key.
+	sock := filepath.Join(home, ".run", "jrnl.sock")
+	srv := exec.Command(bin, "serve")
+	srv.Env = append(serveEnv(home), "JRNL_CHAT_URL="+e.url+"/v1", "JRNL_CHAT_KEY=server-key",
+		"JRNL_CHAT_MODEL=test/vision", "JRNL_CHAT_EXTRA=", "JRNL_RERANK_URL=")
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Process.Kill(); srv.Wait() })
+	for i := 0; ; i++ {
+		if _, _, ok := runningServer(sock); ok {
+			break
+		}
+		if i == 200 {
+			t.Fatal("jrnl serve did not start")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	e.must("Login form rejects valid credentials.", "add", "--kind", "bug")
+	e.must("rerank-me: Login is slow on Mondays.", "add")
+	client := e.extra
+	e.extra = append(client, "CLAUDE_CODE_SESSION_ID=sess-0")
+	e.must("Login from the session before.", "add", "--at", "2 hours ago")
+	e.extra = client
+
+	lastAuth := func() any {
+		e.ai.mu.Lock()
+		defer e.ai.mu.Unlock()
+		return e.ai.chatReqs[len(e.ai.chatReqs)-1]["auth"]
+	}
+	out := e.must("", "search", "Login")
+	if !strings.Contains(strings.SplitN(out, "\n", 2)[0], "rerank-me") || lastAuth() != "Bearer server-key" {
+		t.Errorf("want the server to rerank (auth %v):\n%s", lastAuth(), out)
+	}
+
+	// Filters are the command's: its clock (JRNL_NOW, a week before the
+	// server's), its session, its kind and order.
+	first := func(args ...string) string {
+		out := e.must("", append([]string{"search"}, args...)...)
+		return strings.SplitN(out, "\n", 2)[0]
+	}
+	if got := first("--on", "today", "--kind", "bug", "Login"); !strings.Contains(got, "Login form") {
+		t.Errorf("--on today --kind bug: got %q", got)
+	}
+	if out := e.must("", "search", "--kind", "bug", "Login"); strings.Contains(out, "rerank-me") || strings.Contains(out, "session before") {
+		t.Errorf("--kind bug should show only the bug:\n%s", out)
+	}
+	if out := e.must("", "search", "--session", "last", "Login"); !strings.Contains(out, "session before") || strings.Contains(out, "Login form") {
+		t.Errorf("--session last should show only the earlier session's entry:\n%s", out)
+	}
+	if got := first("--oldest", "Login"); !strings.Contains(got, "session before") {
+		t.Errorf("--oldest: got %q first", got)
+	}
+
+	e.extra = append(e.extra, "JRNL_CHAT_MODEL=test/other")
+	out = e.must("", "search", "Login")
+	if !strings.Contains(strings.SplitN(out, "\n", 2)[0], "rerank-me") || lastAuth() != "Bearer client-key" {
+		t.Errorf("with other settings the command should rerank by itself (auth %v):\n%s", lastAuth(), out)
+	}
+	if _, _, ok := runningServer(sock); !ok {
+		t.Error("the server should stay up for commands with its own settings")
+	}
 }
 
 // With no embeddings API set up, jrnl embeds in its own process: a reworded
@@ -2020,11 +2271,11 @@ func TestBrokenModelWaits(t *testing.T) {
 // them, and refuses a file that is not the one expected.
 func TestModelDownload(t *testing.T) {
 	needLocalModel(t)
-	var corrupt bool
+	var corrupt atomic.Bool // the background server reads it too
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for _, f := range localFiles {
 			if r.URL.Path == "/"+localRepo+"/resolve/"+localRev+"/"+f[1] {
-				if corrupt && f[0] == "model.onnx" {
+				if corrupt.Load() && f[0] == "model.onnx" {
 					io.WriteString(w, "<html>please log in to the hotel wifi</html>")
 					return
 				}
@@ -2039,7 +2290,7 @@ func TestModelDownload(t *testing.T) {
 	quitServerAt(t, e.home)
 	dir := filepath.Join(t.TempDir(), "model")
 	e.extra = []string{"JRNL_EMBED_URL=", "JRNL_EMBED_MODEL=", "JRNL_MODEL_DIR=" + dir, "JRNL_MODELS_URL=" + hub.URL}
-	corrupt = true // before add, whose background server downloads too
+	corrupt.Store(true) // before add, whose background server downloads too
 	e.must("Users could not sign in after the token refresh.", "add")
 	if _, errOut, _ := e.run("", "reindex"); !strings.Contains(errOut, "SHA-256") {
 		t.Errorf("a wrong file should be refused: %q", errOut)
@@ -2047,7 +2298,7 @@ func TestModelDownload(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "model.onnx")); err == nil {
 		t.Error("the wrong file was kept")
 	}
-	corrupt = false
+	corrupt.Store(false)
 	if out := e.must("", "reindex"); !strings.Contains(out, "embedded 1 ") {
 		t.Fatalf("reindex after downloading: %q", out)
 	}

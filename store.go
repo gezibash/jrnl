@@ -749,6 +749,59 @@ func (f Filter) where() (string, []any, error) {
 	return strings.Join(cl, " AND "), args, nil
 }
 
+// pinDates turns --since, --until and --on into exact instants, read in
+// this process's clock and zone, so another process (jrnl serve, started
+// earlier, perhaps elsewhere) filters the same entries.
+func (f *Filter) pinDates() error {
+	ref := now()
+	var since, until time.Time
+	if f.Since != "" {
+		sp, err := parseWhen(f.Since, ref)
+		if err != nil {
+			return fmt.Errorf("--since: %w", err)
+		}
+		since = sp.start
+	}
+	// A point is included; a day, week or month runs through its end.
+	last := func(sp span) time.Time {
+		if sp.end.Equal(sp.start) {
+			return sp.end
+		}
+		return sp.end.Add(-time.Nanosecond)
+	}
+	if f.Until != "" {
+		sp, err := parseWhen(f.Until, ref)
+		if err != nil {
+			return fmt.Errorf("--until: %w", err)
+		}
+		until = last(sp)
+	}
+	if f.On != "" {
+		sp, err := parseWhen(f.On, ref)
+		if err != nil {
+			return fmt.Errorf("--on: %w", err)
+		}
+		if sp.end.Equal(sp.start) {
+			return fmt.Errorf("--on needs a day, week or month, not a point in time")
+		}
+		// Every bound holds: the later start, the earlier end.
+		if since.IsZero() || sp.start.After(since) {
+			since = sp.start
+		}
+		if end := last(sp); until.IsZero() || end.Before(until) {
+			until = end
+		}
+		f.On = ""
+	}
+	if !since.IsZero() {
+		f.Since = since.UTC().Format(time.RFC3339Nano)
+	}
+	if !until.IsZero() {
+		f.Until = until.UTC().Format(time.RFC3339Nano)
+	}
+	return nil
+}
+
 // LastSession is the most recently active session other than skip (the
 // caller's own), so "the last session" means the one before this one.
 func (s *Store) LastSession(skip string) (string, error) {
@@ -756,10 +809,12 @@ func (s *Store) LastSession(skip string) (string, error) {
 	err := s.db.QueryRow(`SELECT session FROM entries WHERE session != '' AND session != ?
 		GROUP BY session ORDER BY max(ts) DESC LIMIT 1`, skip).Scan(&id)
 	if err == sql.ErrNoRows {
-		return "", fmt.Errorf("no earlier session in this journal")
+		return "", errNoSession
 	}
 	return id, err
 }
+
+var errNoSession = errors.New("no earlier session in this journal")
 
 type SessionInfo struct {
 	ID, First, Last, LastTitle string

@@ -25,6 +25,23 @@ curl -fsSL https://raw.githubusercontent.com/gezibash/jrnl/main/install.sh | sh
 
 Or download a binary from the releases page, or `go install github.com/gezibash/jrnl@main`.
 
+jrnl is made to run on every agent prompt, so keep a mise shim out of its
+way: each shim runs mise before the tool, 100-300 ms a call. With mise, use
+`mise activate` in your shell and turn shims off, so the real binary is on
+PATH (`jrnl doctor` warns when it finds a shim):
+
+```bash
+mise settings set activate_shims false
+```
+
+For Claude Code, whose commands don't run your shell's prompt hooks, a
+SessionStart hook can put the project's tools on PATH once per session:
+
+```json
+{ "type": "command",
+  "command": "[ -n \"$CLAUDE_ENV_FILE\" ] && p=$(mise bin-paths 2>/dev/null | paste -sd: -) && [ -n \"$p\" ] && echo \"export PATH=\\\"$p:\\$PATH\\\"\" >> \"$CLAUDE_ENV_FILE\" || true" }
+```
+
 Homebrew's own `jrnl` formula is a different program, a Python note taker.
 Install from the tap as shown above. Both install a `jrnl` command, so keep one.
 
@@ -90,7 +107,15 @@ role with an OpenAI-compatible API, so the file's key is never sent to it; a
 Keys that are not in the environment are read from `~/.config/jrnl/.env` (or
 `JRNL_ENV_FILE`), one `KEY=value` per line. That file can be a
 [1Password Environment](https://www.1password.dev/environments/local-env-file)
-mounted as a local `.env` file, so keys never sit on disk.
+mounted as a local `.env` file, so keys never sit on disk. jrnl reads it
+only when a request needs a key or account that the environment lacks, so
+commands that call no API (list, show, add, `search --fast`) never wait on
+it. The file is for keys and accounts. Put every other setting (`_URL`,
+`_MODEL`, `JRNL_CHAT_EXTRA`, `OLLAMA_HOST`) in `config.toml` or the
+environment: jrnl ignores them in this file, except a `_MODEL` for a role
+whose `_URL` names no model. A command waits up to 10 s for the file and
+`jrnl serve` 1 s; the server's read goes on behind it, so a 1Password prompt
+approved later still reaches the server.
 
 `jrnl doctor` shows which parts are on, which models they use, where each was
 set, and how to turn on the rest. After turning one on, or switching
