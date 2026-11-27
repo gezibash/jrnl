@@ -1458,6 +1458,11 @@ func TestDoctorFindsMiseShim(t *testing.T) {
 		t.Errorf("doctor should warn about a script shim:\n%s", out)
 	}
 	os.Remove(filepath.Join(shims, "jrnl"))
+	os.WriteFile(filepath.Join(shims, "jrnl"), []byte("#!/bin/sh\nexec "+dir+"/mise/installs/jrnl/4.0.2/jrnl \"$@\"\n"), 0o755)
+	if out := e.must("", "doctor"); strings.Contains(out, "mise shim") {
+		t.Errorf("a script that runs the installed binary is no shim:\n%s", out)
+	}
+	os.Remove(filepath.Join(shims, "jrnl"))
 	os.Symlink(bin, filepath.Join(shims, "jrnl"))
 	if out := e.must("", "doctor"); strings.Contains(out, "mise shim") {
 		t.Errorf("a real binary on PATH is no shim:\n%s", out)
@@ -1951,31 +1956,45 @@ func TestServeOneServerOfTheCurrentVersion(t *testing.T) {
 		t.Error("the older server is still running after the upgrade")
 	}
 
-	// A search by a binary of another version gets a server of its own
-	// version for the next command: hooks keep an old server alive, so
-	// otherwise an upgrade never reaches the fast path.
-	for _, args := range [][]string{{"add", "Login form rejects valid credentials."}, {"search", "--fast", "Login"}} {
-		c := exec.Command(bin, append(args, "--project", "t")...)
+	// An older binary leaves the newer server alone, by its search or its
+	// serve --background (hooks run either): two installed versions must
+	// not take turns replacing each other, each reloading the model. A
+	// build without a release number (dev) counts as the oldest.
+	for _, args := range [][]string{{"add", "Login form rejects valid credentials.", "--project", "t"}, {"search", "--fast", "Login", "--project", "t"}, {"serve", "--background"}} {
+		c := exec.Command(bin, args...)
 		c.Env = env
 		if out, err := c.CombinedOutput(); err != nil {
 			t.Fatalf("%v: %v\n%s", args, err, out)
 		}
 	}
-	waitFor("jrnl dev ")
-	t.Cleanup(func() { socketClient(sock).Post("http://jrnl/quit", "", nil) })
+	time.Sleep(2 * time.Second)
+	if got := health(); !strings.HasPrefix(got, "jrnl 9.9.9 ") {
+		t.Errorf("an older binary replaced the newer server: health %q", got)
+	}
 
-	// An older binary's search leaves the newer server alone (dev is newer
-	// than any release): two installed versions must not take turns
-	// replacing each other, each replacement reloading the model.
+	// A search by a newer binary gets a server of its version for the next
+	// command: hooks keep an old server alive, so otherwise an upgrade
+	// never reaches the fast path.
+	socketClient(sock).Post("http://jrnl/quit", "", nil)
+	for range 100 {
+		if health() == "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	old := exec.Command(bin, "serve", "--background")
+	old.Env = env
+	if out, err := old.CombinedOutput(); err != nil {
+		t.Fatalf("serve --background: %v\n%s", err, out)
+	}
+	waitFor("jrnl dev ")
 	c := exec.Command(newer, "search", "--fast", "Login", "--project", "t")
 	c.Env = env
 	if out, err := c.CombinedOutput(); err != nil {
 		t.Fatalf("search by 9.9.9: %v\n%s", err, out)
 	}
-	time.Sleep(2 * time.Second)
-	if got := health(); !strings.HasPrefix(got, "jrnl dev ") {
-		t.Errorf("an older binary's search replaced the newer server: health %q", got)
-	}
+	waitFor("jrnl 9.9.9 ")
+	t.Cleanup(func() { socketClient(sock).Post("http://jrnl/quit", "", nil) })
 }
 
 // A decision can say which earlier one it replaces, at add time or later

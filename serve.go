@@ -54,12 +54,15 @@ func cmdServe(args []string) error {
 	lockPath := filepath.Join(dir, "jrnl.lock")
 
 	if *background {
-		// A server of another version (an upgrade, or a switch between
-		// installs) is asked to quit, and its lock awaited, so the new
-		// binary serves.
+		// An older server (an upgrade) is asked to quit, and its lock
+		// awaited, so the new binary serves.
 		if running, _, ok := runningServer(sock); ok {
 			if running == version {
 				fmt.Println("jrnl serve: already running at", sock)
+				return nil
+			}
+			if !older(running, version) {
+				fmt.Printf("jrnl serve: %s, which is newer, is already running at %s\n", running, sock)
 				return nil
 			}
 			if err := quitServer(sock, lockPath); err != nil {
@@ -557,10 +560,14 @@ func (sv *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no journal for "+req.Project, http.StatusNotFound)
 		return
 	}
-	if err != nil {
-		// The command would fail the same way by itself (a bad filter, an
-		// unknown session): it reports this, and does not search again.
+	if errors.Is(err, errNoSession) {
+		// The command would fail the same way by itself: it reports
+		// this, and does not search again.
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	hits, more := finishHits(sv.ai, req, hits, hasVec)
@@ -594,7 +601,8 @@ func serverQuery(ai *AI, req query) (res queryResult, ok bool, err error) {
 }
 
 // older says server version a is older than b. A build without a release
-// number (dev) is newer than any release. A binary replaces only an older
+// number (dev) is older than any release, so an installed release keeps its
+// server against a development build. A binary replaces only an older
 // server, so two installed versions never take turns replacing each other.
 func older(a, b string) bool {
 	parse := func(v string) []int {
@@ -610,9 +618,9 @@ func older(a, b string) bool {
 	}
 	na, nb := parse(a), parse(b)
 	switch {
-	case na == nil:
-		return false
 	case nb == nil:
+		return false
+	case na == nil:
 		return true
 	}
 	return slices.Compare(na, nb) < 0

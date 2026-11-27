@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -1423,5 +1424,9 @@ func isMiseShim(p string) bool {
 	defer f.Close()
 	head := make([]byte, 512)
 	n, _ := io.ReadFull(f, head)
-	return strings.HasPrefix(string(head[:n]), "#!") && strings.Contains(string(head[:n]), "mise")
+	return strings.HasPrefix(string(head[:n]), "#!") && miseCommand.Match(head[:n])
 }
+
+// miseCommand is a call to the mise binary: "mise x", "/path/to/mise exec",
+// not a path through mise's install folder.
+var miseCommand = regexp.MustCompile(`(^|[\s/"'])mise(\s|["']|$)`)

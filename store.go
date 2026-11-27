@@ -809,10 +809,12 @@ func (s *Store) LastSession(skip string) (string, error) {
 	err := s.db.QueryRow(`SELECT session FROM entries WHERE session != '' AND session != ?
 		GROUP BY session ORDER BY max(ts) DESC LIMIT 1`, skip).Scan(&id)
 	if err == sql.ErrNoRows {
-		return "", fmt.Errorf("no earlier session in this journal")
+		return "", errNoSession
 	}
 	return id, err
 }
+
+var errNoSession = errors.New("no earlier session in this journal")
 
 type SessionInfo struct {
 	ID, First, Last, LastTitle string
